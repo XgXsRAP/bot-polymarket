@@ -27,6 +27,7 @@ import streamlit as st
 import json
 import time
 import os
+import requests
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -296,6 +297,26 @@ def fmt_uptime(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+@st.cache_data(ttl=60)
+def fetch_btc_candles(limit: int = 30) -> pd.DataFrame:
+    """Fetch BTC/USDT 1-minute candles from Binance REST (public, no auth)."""
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        resp = requests.get(url, params={"symbol": "BTCUSDT", "interval": "1m", "limit": limit}, timeout=5)
+        resp.raise_for_status()
+        raw = resp.json()
+        df = pd.DataFrame(raw, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_vol", "trades", "taker_buy_base",
+            "taker_buy_quote", "ignore"
+        ])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+        df["time"] = pd.to_datetime(df["open_time"], unit="ms")
+        return df[["time", "open", "high", "low", "close", "volume"]]
+    except Exception:
+        return pd.DataFrame()
+
 
 # ─────────────────────────────────────────────
 #  SIDEBAR — Controls
@@ -445,67 +466,87 @@ def render_header(state: dict):
 
 
 def render_pnl_chart(state: dict, trades: list):
-    st.markdown('<div class="section-label">P&L History</div>', unsafe_allow_html=True)
+    tab_pnl, tab_btc = st.tabs(["P&L History", "BTC 1m Candles"])
 
-    pnl_hist = state.get("pnl_history", [])
+    with tab_pnl:
+        pnl_hist = state.get("pnl_history", [])
+        if trades:
+            df = pd.DataFrame(trades)
+            if "exit_time" in df.columns and "pnl" in df.columns:
+                df = df[df["status"] == "closed"].copy()
+                df["exit_time"] = pd.to_datetime(df["exit_time"], unit="s")
+                df = df.sort_values("exit_time")
+                df["cum_pnl"] = df["pnl"].cumsum()
 
-    if trades:
-        # Build cumulative P&L from trade history
-        df = pd.DataFrame(trades)
-        if "exit_time" in df.columns and "pnl" in df.columns:
-            df = df[df["status"] == "closed"].copy()
-            df["exit_time"] = pd.to_datetime(df["exit_time"], unit="s")
-            df = df.sort_values("exit_time")
-            df["cum_pnl"] = df["pnl"].cumsum()
-
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=df["exit_time"],
+                    y=df["cum_pnl"],
+                    mode="lines",
+                    fill="tozeroy",
+                    line=dict(color="#4a9eff", width=1.5),
+                    fillcolor="rgba(74,158,255,0.06)",
+                    name="Cumulative P&L",
+                    hovertemplate="<b>%{x}</b><br>P&L: $%{y:.4f}<extra></extra>"
+                ))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    height=220,
+                    margin=dict(l=0, r=0, t=8, b=0),
+                    xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=10)),
+                    yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=10)),
+                    showlegend=False,
+                    hovermode="x unified"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        elif pnl_hist:
+            color = "#48bb78" if pnl_hist[-1] >= 0 else "#fc8181"
+            fill_color = "rgba(72,187,120,0.07)" if pnl_hist[-1] >= 0 else "rgba(252,129,129,0.07)"
             fig = go.Figure()
             fig.add_trace(go.Scatter(
-                x=df["exit_time"],
-                y=df["cum_pnl"],
-                mode="lines",
-                fill="tozeroy",
-                line=dict(color="#4a9eff", width=1.5),
-                fillcolor="rgba(74,158,255,0.06)",
-                name="Cumulative P&L",
-                hovertemplate="<b>%{x}</b><br>P&L: $%{y:.4f}<extra></extra>"
+                y=pnl_hist, mode="lines", fill="tozeroy",
+                line=dict(color=color, width=1.5), fillcolor=fill_color
             ))
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                height=180, margin=dict(l=0, r=0, t=8, b=0),
+                xaxis=dict(showgrid=False, showticklabels=False),
+                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=10)),
+                showlegend=False
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("P&L chart will appear after the first trade closes.")
+
+    with tab_btc:
+        candles = fetch_btc_candles(30)
+        if candles.empty:
+            st.caption("Could not fetch BTC candles — check internet connection.")
+        else:
+            fig = go.Figure(data=[go.Candlestick(
+                x=candles["time"],
+                open=candles["open"],
+                high=candles["high"],
+                low=candles["low"],
+                close=candles["close"],
+                increasing_line_color="#48bb78",
+                decreasing_line_color="#fc8181",
+                increasing_fillcolor="rgba(72,187,120,0.3)",
+                decreasing_fillcolor="rgba(252,129,129,0.3)",
+                name="BTC/USDT"
+            )])
             fig.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
-                height=200,
+                height=220,
                 margin=dict(l=0, r=0, t=8, b=0),
-                xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=10)),
-                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=10)),
+                xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=9), rangeslider_visible=False),
+                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=9)),
                 showlegend=False,
                 hovermode="x unified"
             )
             st.plotly_chart(fig, use_container_width=True)
-            return
-
-    # Fallback: use live pnl_history array from state
-    if pnl_hist:
-        fig = go.Figure()
-        color = "#48bb78" if pnl_hist[-1] >= 0 else "#fc8181"
-        fill_color = "rgba(72,187,120,0.07)" if pnl_hist[-1] >= 0 else "rgba(252,129,129,0.07)"
-        fig.add_trace(go.Scatter(
-            y=pnl_hist,
-            mode="lines",
-            fill="tozeroy",
-            line=dict(color=color, width=1.5),
-            fillcolor=fill_color
-        ))
-        fig.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=160,
-            margin=dict(l=0, r=0, t=8, b=0),
-            xaxis=dict(showgrid=False, showticklabels=False),
-            yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=10)),
-            showlegend=False
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.caption("P&L chart will appear after the first trade closes.")
 
 
 def render_open_trades(state: dict):
@@ -581,6 +622,16 @@ def render_trade_history(trades: list):
         hide_index=True
     )
 
+    # CSV export
+    csv = pd.DataFrame(trades).to_csv(index=False)
+    st.download_button(
+        "⬇ Export all trades (.csv)",
+        data=csv,
+        file_name=f"trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
 
 def render_win_rate_chart(trades: list):
     st.markdown('<div class="section-label">Win / Loss Breakdown</div>', unsafe_allow_html=True)
@@ -618,6 +669,170 @@ def render_win_rate_chart(trades: list):
         )]
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+def render_momentum_gauge(state: dict):
+    st.markdown('<div class="section-label">BTC Momentum</div>', unsafe_allow_html=True)
+
+    mom_1m = state.get("btc_change_1m", 0.0) * 100
+    mom_5m = state.get("btc_change_5m", 0.0) * 100
+
+    fig = go.Figure()
+    fig.add_trace(go.Indicator(
+        mode="gauge+number+delta",
+        value=round(mom_1m, 4),
+        delta={"reference": 0, "valueformat": "+.4f", "suffix": "%"},
+        number={"suffix": "%", "font": {"size": 20, "color": "#e2e8f0"}},
+        gauge={
+            "axis": {"range": [-0.5, 0.5], "tickcolor": "#4a5568", "tickfont": {"size": 9}},
+            "bar": {"color": "#48bb78" if mom_1m >= 0 else "#fc8181", "thickness": 0.25},
+            "bgcolor": "#0f1318",
+            "bordercolor": "#1e2530",
+            "steps": [
+                {"range": [-0.5, -0.1], "color": "rgba(252,129,129,0.12)"},
+                {"range": [-0.1, 0.1],  "color": "rgba(74,85,104,0.12)"},
+                {"range": [0.1, 0.5],   "color": "rgba(72,187,120,0.12)"},
+            ],
+            "threshold": {"line": {"color": "#4a9eff", "width": 2}, "thickness": 0.8, "value": mom_1m},
+        },
+        title={"text": "1m %", "font": {"size": 10, "color": "#4a5568"}},
+        domain={"x": [0, 0.5], "y": [0, 1]}
+    ))
+    fig.add_trace(go.Indicator(
+        mode="gauge+number",
+        value=round(mom_5m, 4),
+        number={"suffix": "%", "font": {"size": 20, "color": "#e2e8f0"}},
+        gauge={
+            "axis": {"range": [-1.0, 1.0], "tickcolor": "#4a5568", "tickfont": {"size": 9}},
+            "bar": {"color": "#48bb78" if mom_5m >= 0 else "#fc8181", "thickness": 0.25},
+            "bgcolor": "#0f1318",
+            "bordercolor": "#1e2530",
+            "steps": [
+                {"range": [-1.0, -0.2], "color": "rgba(252,129,129,0.12)"},
+                {"range": [-0.2, 0.2],  "color": "rgba(74,85,104,0.12)"},
+                {"range": [0.2, 1.0],   "color": "rgba(72,187,120,0.12)"},
+            ],
+        },
+        title={"text": "5m %", "font": {"size": 10, "color": "#4a5568"}},
+        domain={"x": [0.5, 1], "y": [0, 1]}
+    ))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=160,
+        margin=dict(l=0, r=0, t=20, b=0),
+        font={"color": "#c8d0dc"},
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_exit_reason_chart(trades: list):
+    st.markdown('<div class="section-label">Exit Reasons</div>', unsafe_allow_html=True)
+
+    if not trades:
+        st.caption("No data yet.")
+        return
+
+    df = pd.DataFrame(trades)
+    if "exit_reason" not in df.columns or "pnl" not in df.columns:
+        st.caption("No data yet.")
+        return
+
+    reason_colors = {
+        "profit_target":    "#48bb78",
+        "stop_loss":        "#fc8181",
+        "max_hold_timeout": "#ed8936",
+        "expiry_approaching": "#a78bfa",
+        "signal_reversal":  "#4a9eff",
+        "market_not_found": "#4a5568",
+    }
+
+    grouped = df.groupby("exit_reason").agg(
+        count=("pnl", "count"),
+        total_pnl=("pnl", "sum")
+    ).reset_index()
+
+    fig = go.Figure()
+    for _, row in grouped.iterrows():
+        reason = row["exit_reason"] or "unknown"
+        color  = reason_colors.get(reason, "#4a5568")
+        fig.add_trace(go.Bar(
+            name=reason,
+            x=[reason.replace("_", " ")],
+            y=[row["count"]],
+            marker_color=color,
+            text=[f"${row['total_pnl']:+.3f}"],
+            textposition="outside",
+            textfont=dict(size=9, color="#8899aa"),
+        ))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=180,
+        margin=dict(l=0, r=0, t=8, b=0),
+        showlegend=False,
+        barmode="group",
+        xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=9)),
+        yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickfont=dict(size=9)),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_duration_histogram(trades: list):
+    st.markdown('<div class="section-label">Hold Duration</div>', unsafe_allow_html=True)
+
+    if not trades:
+        st.caption("No data yet.")
+        return
+
+    df = pd.DataFrame(trades)
+    if "entry_time" not in df.columns or "exit_time" not in df.columns:
+        st.caption("No data yet.")
+        return
+
+    df = df[(df["exit_time"] > 0) & (df["entry_time"] > 0)].copy()
+    df["duration_s"] = (df["exit_time"] - df["entry_time"]).clip(lower=0)
+
+    if df.empty:
+        st.caption("No closed trades yet.")
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=df["duration_s"],
+        nbinsx=20,
+        marker_color="#4a9eff",
+        marker_line_color="#1e2530",
+        marker_line_width=1,
+        opacity=0.8,
+    ))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=180,
+        margin=dict(l=0, r=0, t=8, b=0),
+        xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=9), title_text="seconds", title_font=dict(size=9, color="#4a5568")),
+        yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickfont=dict(size=9)),
+        bargap=0.05,
+    )
+    avg = df["duration_s"].mean()
+    fig.add_vline(x=avg, line_dash="dash", line_color="#ed8936", line_width=1,
+                  annotation_text=f"avg {avg:.0f}s", annotation_font=dict(size=9, color="#ed8936"),
+                  annotation_position="top right")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_health_banner(state: dict):
+    last_upd = state.get("last_updated")
+    running  = state.get("running", False)
+    paused   = state.get("paused", False)
+
+    if not running and not last_upd:
+        st.warning("⚠️ Bot is not running — start it with: `python bot.py --mode paper`", icon="⚠️")
+    elif paused:
+        st.info("⏸ Bot is paused — click **▶ Start** in the sidebar to resume.", icon="ℹ️")
+    elif running:
+        st.success(f"✅ Bot running — last update: {last_upd}", icon="✅")
 
 
 def render_risk_meters(state: dict):
@@ -741,23 +956,30 @@ def main():
     # Sidebar
     render_sidebar(state)
 
+    # ── Health banner ──
+    render_health_banner(state)
+
     # Header metrics
     render_header(state)
     st.markdown("---")
 
-    # ── Row 1: P&L chart + open positions ──
+    # ── Row 1: P&L/Candle tabs + open positions ──
     col_chart, col_open = st.columns([2, 1])
     with col_chart:
         render_pnl_chart(state, trades)
     with col_open:
         render_open_trades(state)
+        st.markdown("---")
+        render_momentum_gauge(state)
 
     st.markdown("---")
 
-    # ── Row 2: Win rate donut + risk meters + stats ──
-    col_wr, col_risk, col_stats = st.columns([1, 1, 1])
+    # ── Row 2: Win/loss donut + exit reasons + risk meters + stats ──
+    col_wr, col_exit, col_risk, col_stats = st.columns([1, 1, 1, 1])
     with col_wr:
         render_win_rate_chart(trades)
+    with col_exit:
+        render_exit_reason_chart(trades)
     with col_risk:
         render_risk_meters(state)
     with col_stats:
@@ -765,12 +987,14 @@ def main():
 
     st.markdown("---")
 
-    # ── Row 3: Log + trade table ──
-    col_log, col_trades = st.columns([1, 1])
+    # ── Row 3: Log + trade table + duration histogram ──
+    col_log, col_trades, col_hist = st.columns([1, 1, 1])
     with col_log:
         render_log(state)
     with col_trades:
         render_trade_history(trades)
+    with col_hist:
+        render_duration_histogram(trades)
 
     # ── Auto-refresh every 2 seconds ──
     time.sleep(2)
