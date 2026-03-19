@@ -10,11 +10,11 @@
 import asyncio
 import json
 import time
-import logging
 import os
 import sys
 import argparse
 import signal
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 from dataclasses import dataclass, field, asdict
@@ -44,7 +44,7 @@ except ImportError as e:
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
-        OrderArgs, OrderType, BUY, SELL
+        OrderArgs, BUY, SELL
     )
     CLOB_AVAILABLE = True
 except ImportError:
@@ -95,10 +95,10 @@ class Config:
     ws_reconnect_delay: float = 1.0
 
     # ── API Endpoints ──
-    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
     clob_rest_url: str = "https://clob.polymarket.com"
     gamma_api_url: str = "https://gamma-api.polymarket.com"
-    binance_ws_url: str = "wss://ws.kraken.com"
+    binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
 
     # ── Files ──
     log_dir: str = "logs"
@@ -154,6 +154,7 @@ class TradeRecord:
     shares: float
     capital_used: float
     entry_time: float
+    token_id: str = ""   # Polygon token ID — required for live exit orders
     exit_price: float = 0.0
     exit_time: float = 0.0
     pnl: float = 0.0
@@ -206,7 +207,7 @@ class BTCPriceFeed:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.current: Optional[BTCPrice] = None
-        self._price_history: list[float] = []
+        self._price_history: deque[float] = deque(maxlen=300)
         self._running = False
         self._latency_ms: float = 0.0
 
@@ -220,18 +221,10 @@ class BTCPriceFeed:
             try:
                 logger.info("📡 Connecting to Binance BTC/USDT feed...")
                 async with websockets.connect(
-                        self.cfg.binance_ws_url,
-                        ping_interval=20,
-                        ping_timeout=10
+                    self.cfg.binance_ws_url,
+                    ping_interval=20,
+                    ping_timeout=10
                 ) as ws:
-                    # Subscribe to Kraken BTC ticker
-                    await ws.send(json.dumps({
-                        "event": "subscribe",
-                        "pair": ["XBT/USD"],
-                        "subscription": {"name": "ticker"}
-                    }))
-                    logger.success("✅ Kraken BTC feed connected")
-                    async for msg in ws:
                     logger.success("✅ Binance feed connected")
                     async for msg in ws:
                         t0 = time.perf_counter()
@@ -244,26 +237,20 @@ class BTCPriceFeed:
     async def _handle(self, raw: str):
         try:
             data = json.loads(raw)
-            # Kraken sends a list for ticker updates
-            if isinstance(data, list) and len(data) > 1:
-                ticker = data[1]
-                price = float(ticker.get("c", [0])[0])
-            elif isinstance(data, dict):
-                price = float(data.get("c", [0])[0] if isinstance(data.get("c"), list) else data.get("c", 0))
-            else:
+            price = float(data.get("c", 0))  # 'c' = current price in Binance ticker
+            if price <= 0:
                 return
 
             self._price_history.append(price)
-            if len(self._price_history) > 300:  # Keep 5 min of data (1/s)
-                self._price_history = self._price_history[-300:]
 
             # Calculate momentum
             change_1m = 0.0
             change_5m = 0.0
-            if len(self._price_history) >= 60:
-                change_1m = (price - self._price_history[-60]) / self._price_history[-60]
-            if len(self._price_history) >= 300:
-                change_5m = (price - self._price_history[-300]) / self._price_history[-300]
+            hist = list(self._price_history)
+            if len(hist) >= 60:
+                change_1m = (price - hist[-60]) / hist[-60]
+            if len(hist) >= 300:
+                change_5m = (price - hist[0]) / hist[0]
 
             self.current = BTCPrice(
                 price=price,
@@ -414,11 +401,9 @@ class PolymarketFeed:
 
     def get_active_markets(self) -> list[MarketContract]:
         """Return markets that haven't expired and are still tradeable."""
-        now = time.time()
         return [
             m for m in self.markets.values()
-            if m.seconds_to_expiry > 30  # At least 30s left
-            and m.seconds_to_expiry < 300  # Within 5 min window
+            if 30 < m.seconds_to_expiry < 300
         ]
 
     async def stop(self):
@@ -499,16 +484,13 @@ class SignalEngine:
         if yes_edge > no_edge and yes_edge >= self.cfg.min_edge_required:
             signal = Signal.YES
             edge = yes_edge
-            entry_price = contract.yes_price
         elif no_edge > yes_edge and no_edge >= self.cfg.min_edge_required:
             signal = Signal.NO
             edge = no_edge
-            entry_price = contract.no_price
         else:
             return Signal.HOLD, 0.0, 0.0
 
-        # Confidence score
-        time_factor = min(contract.seconds_to_expiry / 300, 1.0)
+        # Confidence score — weighted by edge magnitude and momentum strength
         momentum_strength = abs(btc.change_1m) / 0.005  # Normalize to 0.5% ref
         confidence = min(edge * 100 + momentum_strength * 0.2, 1.0)
 
@@ -718,6 +700,7 @@ class LiveTrader:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.client: Optional[ClobClient] = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self._initialize_client()
 
     def _initialize_client(self):
@@ -743,6 +726,10 @@ class LiveTrader:
             logger.error(f"CLOB client init failed: {e}")
             self.client = None
 
+    async def _ensure_session(self):
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession()
+
     async def enter(
         self,
         contract: MarketContract,
@@ -756,7 +743,7 @@ class LiveTrader:
 
         t0 = time.perf_counter()
         try:
-            # Determine token ID (YES or NO token on Polygon)
+            await self._ensure_session()
             token_id = await self._get_token_id(contract, signal)
             if not token_id:
                 return None
@@ -784,7 +771,8 @@ class LiveTrader:
                 entry_price=entry_price,
                 shares=shares,
                 capital_used=shares * entry_price,
-                entry_time=time.time()
+                entry_time=time.time(),
+                token_id=token_id,
             )
             return trade
 
@@ -793,16 +781,15 @@ class LiveTrader:
             return None
 
     async def _get_token_id(self, contract: MarketContract, signal: Signal) -> Optional[str]:
-        """Fetch YES/NO token IDs for a market."""
+        """Fetch YES/NO token ID for a market using the shared session."""
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.cfg.gamma_api_url}/markets"
-                async with session.get(url, params={"conditionId": contract.condition_id}) as r:
-                    data = await r.json()
-                    for m in data:
-                        for token in m.get("tokens", []):
-                            if token.get("outcome", "").upper() == signal.value:
-                                return token.get("token_id")
+            url = f"{self.cfg.gamma_api_url}/markets"
+            async with self._session.get(url, params={"conditionId": contract.condition_id}) as r:
+                data = await r.json()
+                for m in data:
+                    for token in m.get("tokens", []):
+                        if token.get("outcome", "").upper() == signal.value:
+                            return token.get("token_id")
         except Exception as e:
             logger.error(f"Token ID fetch failed: {e}")
         return None
@@ -817,9 +804,18 @@ class LiveTrader:
         if not self.client:
             return trade
         try:
-            # For live: post a SELL order at exit_price
-            # Implementation depends on having token_id stored on trade
-            logger.info(f"🔴 LIVE SELL | {trade.trade_id} @ ${exit_price:.4f} | Reason: {reason}")
+            if not trade.token_id:
+                logger.error(f"Cannot exit {trade.trade_id} — token_id missing")
+                return trade
+
+            order = OrderArgs(
+                token_id=trade.token_id,
+                price=exit_price,
+                size=trade.shares,
+                side=SELL
+            )
+            result = self.client.create_and_post_order(order)
+
             trade.exit_price = exit_price
             trade.exit_time = time.time()
             trade.pnl = (exit_price - trade.entry_price) * trade.shares
@@ -827,9 +823,19 @@ class LiveTrader:
             trade.status = TradeStatus.CLOSED.value
             trade.exit_reason = reason
             risk.record_trade_result(trade.pnl)
+
+            logger.info(
+                f"🔴 LIVE SELL | {trade.trade_id} @ ${exit_price:.4f} | "
+                f"P&L: ${trade.pnl:+.4f} | Reason: {reason} | "
+                f"OrderID: {result.get('orderID','?')}"
+            )
         except Exception as e:
             logger.error(f"Order exit failed: {e}")
         return trade
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -875,7 +881,7 @@ Current BTC market data:
 - 1-minute change: {btc.change_1m*100:+.4f}%
 - 5-minute change: {btc.change_5m*100:+.4f}%
 - Volume (24h): {btc.volume:,.0f}
-- Timestamp: {datetime.utcnow().strftime('%H:%M:%S UTC')}
+- Timestamp: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}
 
 Task: Classify the current micro-trend for the next 5 minutes and provide a trading multiplier.
 
@@ -894,11 +900,10 @@ Rules:
 - volatile: erratic moves, multiplier 0.6-0.9
 - trade_multiplier affects position sizing: >1.0 means increase size"""
 
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
+            response = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: self.client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=200,
                     messages=[{"role": "user", "content": prompt}]
                 )
@@ -1008,9 +1013,13 @@ class PolymarketBot:
             logger.info("📋 PAPER TRADING MODE — No real money used")
 
         self._running = False
+        self._paused = False
         self._open_trades: dict[str, TradeRecord] = {}
         self._scan_count = 0
+        self._start_time = time.time()
         self._last_status_time = time.time()
+        self._pnl_history: list[float] = []
+        self._ai_analysis: dict = {"regime": "unknown", "trade_multiplier": 1.0}
 
     async def start(self):
         self._running = True
@@ -1027,7 +1036,9 @@ class PolymarketBot:
             self.btc_feed.connect(),
             self.poly_feed.start(),
             self._main_loop(),
-            self._status_reporter()
+            self._status_reporter(),
+            self._state_writer(),
+            self._command_reader(),
         )
 
     async def _main_loop(self):
@@ -1050,12 +1061,92 @@ class PolymarketBot:
             sleep_time = max(0, (self.cfg.target_latency_ms - elapsed) / 1000)
             await asyncio.sleep(sleep_time)
 
+    async def _state_writer(self):
+        """Write bot state to JSON every second so the dashboard can read it."""
+        while self._running:
+            try:
+                btc = self.btc_feed.current
+                open_list = []
+                for t in self._open_trades.values():
+                    contract = self.poly_feed.markets.get(t.condition_id)
+                    current_price = (
+                        (contract.yes_price if t.side == "YES" else contract.no_price)
+                        if contract else t.entry_price
+                    )
+                    open_list.append({
+                        **asdict(t),
+                        "current_price": current_price,
+                        "question": contract.question if contract else "",
+                    })
+
+                state = {
+                    "running": self._running,
+                    "paused": self._paused,
+                    "mode": self.mode,
+                    "capital": self.risk.capital,
+                    "start_capital": self.risk.daily_start_capital,
+                    "btc_price": btc.price if btc else 0.0,
+                    "btc_change_1m": btc.change_1m if btc else 0.0,
+                    "btc_change_5m": btc.change_5m if btc else 0.0,
+                    "wins": self.risk.wins_today,
+                    "losses": self.risk.losses_today,
+                    "open_trades": open_list,
+                    "markets_tracked": len(self.poly_feed.get_active_markets()),
+                    "last_latency_ms": self.btc_feed.latency_ms,
+                    "scan_count": self._scan_count,
+                    "consecutive_losses": self.risk.consecutive_losses,
+                    "claude_enabled": self.cfg.claude_enabled,
+                    "claude_regime": self._ai_analysis.get("regime", "unknown"),
+                    "claude_multiplier": self._ai_analysis.get("trade_multiplier", 1.0),
+                    "uptime_seconds": int(time.time() - self._start_time),
+                    "pnl_history": self._pnl_history[-200:],
+                    "last_updated": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+                }
+                Path(self.cfg.data_dir).mkdir(exist_ok=True)
+                with open(f"{self.cfg.data_dir}/bot_state.json", "w") as f:
+                    json.dump(state, f)
+            except Exception as e:
+                logger.debug(f"State write error: {e}")
+            await asyncio.sleep(1)
+
+    async def _command_reader(self):
+        """Read commands written by the dashboard (pause/stop/set_claude)."""
+        cmd_file = f"{self.cfg.data_dir}/bot_commands.json"
+        last_ts: float = 0.0
+        while self._running:
+            try:
+                if os.path.exists(cmd_file):
+                    with open(cmd_file) as f:
+                        cmd = json.load(f)
+                    ts = cmd.get("timestamp", 0.0)
+                    if ts > last_ts:
+                        last_ts = ts
+                        action = cmd.get("action", "")
+                        if action == "pause":
+                            self._paused = True
+                            logger.info("⏸  Bot paused via dashboard")
+                        elif action == "start":
+                            self._paused = False
+                            logger.info("▶  Bot resumed via dashboard")
+                        elif action == "stop":
+                            logger.info("■  Stop command received from dashboard")
+                            self.stop()
+                        elif action == "set_claude":
+                            self.cfg.claude_enabled = bool(cmd.get("value", False))
+                            logger.info(f"🤖 ClaudeBot {'enabled' if self.cfg.claude_enabled else 'disabled'} via dashboard")
+            except Exception as e:
+                logger.debug(f"Command read error: {e}")
+            await asyncio.sleep(1)
+
     async def _scan_and_trade(self):
         """Scan markets and enter new positions if signal detected."""
         if not self.btc_feed.current:
             return
 
-        can_trade, reason = self.risk.can_trade()
+        if self._paused:
+            return
+
+        can_trade, _ = self.risk.can_trade()
         if not can_trade:
             return
 
@@ -1066,8 +1157,8 @@ class PolymarketBot:
             return
 
         # Get AI market regime (async, cached)
-        ai_analysis = await self.claude_bot.analyze_market_regime(btc)
-        trade_multiplier = ai_analysis.get("trade_multiplier", 1.0)
+        self._ai_analysis = await self.claude_bot.analyze_market_regime(btc)
+        trade_multiplier = self._ai_analysis.get("trade_multiplier", 1.0)
 
         # Limit concurrent open positions to 3
         if len(self._open_trades) >= 3:
@@ -1098,7 +1189,7 @@ class PolymarketBot:
             logger.debug(
                 f"Signal: {signal.value} | Edge: {edge*100:.3f}% | "
                 f"Conf: {adjusted_confidence:.2f} | "
-                f"${position_size:.2f} | Regime: {ai_analysis.get('regime','?')}"
+                f"${position_size:.2f} | Regime: {self._ai_analysis.get('regime','?')}"
             )
 
             # Enter trade
@@ -1118,7 +1209,7 @@ class PolymarketBot:
         trades_to_close = []
         btc = self.btc_feed.current
 
-        for trade_id, trade in self._open_trades.items():
+        for trade in self._open_trades.values():
             contract = self.poly_feed.markets.get(trade.condition_id)
             if not contract:
                 # Market no longer tracked, force exit
@@ -1139,7 +1230,7 @@ class PolymarketBot:
                 del self._open_trades[trade.trade_id]
 
     async def _status_reporter(self):
-        """Print status summary every 30 seconds."""
+        """Print status summary every 30 seconds and track P&L history."""
         await asyncio.sleep(10)
         while self._running:
             btc_price = self.btc_feed.current.price if self.btc_feed.current else 0
@@ -1152,6 +1243,10 @@ class PolymarketBot:
                 f"Scans: {self._scan_count} | "
                 f"{self.risk.report()}"
             )
+
+            # Track P&L history for dashboard chart (capital delta from start)
+            pnl_now = self.risk.capital - self.risk.daily_start_capital
+            self._pnl_history.append(round(pnl_now, 4))
 
             # Print paper trade summary
             if isinstance(self.trader, PaperTrader):
@@ -1169,6 +1264,8 @@ class PolymarketBot:
     def stop(self):
         self._running = False
         self.btc_feed.stop()
+        if isinstance(self.trader, LiveTrader):
+            asyncio.create_task(self.trader.close())
         logger.info("🛑 Bot stopped")
 
 
