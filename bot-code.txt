@@ -98,7 +98,10 @@ class Config:
     clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
     clob_rest_url: str = "https://clob.polymarket.com"
     gamma_api_url: str = "https://gamma-api.polymarket.com"
+    # Kraken is accessible globally (no geo-block). Binance is blocked in some regions.
+    # Kraken format: {"a":["price",...], "b":["price",...], ...} on the ticker channel
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
+    kraken_ws_url: str = "wss://ws.kraken.com"
 
     # ── Files ──
     log_dir: str = "logs"
@@ -202,7 +205,11 @@ def setup_logging(cfg: Config):
 # ═══════════════════════════════════════════════════════════
 
 class BTCPriceFeed:
-    """Real-time BTC price from Binance WebSocket — free, no auth needed."""
+    """
+    Real-time BTC price feed — tries Binance first, falls back to Kraken.
+    Binance is geo-blocked in some regions (HTTP 451). Kraken is globally accessible.
+    Both feeds are free and require no authentication.
+    """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -217,6 +224,21 @@ class BTCPriceFeed:
 
     async def connect(self):
         self._running = True
+        # Try Binance first — if geo-blocked, switch to Kraken permanently
+        binance_blocked = False
+        while self._running:
+            if binance_blocked:
+                await self._connect_kraken()
+            else:
+                blocked = await self._connect_binance()
+                if blocked:
+                    binance_blocked = True
+                    logger.warning("⚠️  Switching BTC feed to Kraken (globally accessible)")
+
+    async def _connect_binance(self) -> bool:
+        """Connect to Binance. Returns True if geo-blocked (caller should switch to Kraken)."""
+        backoff = self.cfg.ws_reconnect_delay
+        attempts = 0
         while self._running:
             try:
                 logger.info("📡 Connecting to Binance BTC/USDT feed...")
@@ -226,41 +248,91 @@ class BTCPriceFeed:
                     ping_timeout=10
                 ) as ws:
                     logger.success("✅ Binance feed connected")
+                    backoff = self.cfg.ws_reconnect_delay
+                    attempts = 0
                     async for msg in ws:
                         t0 = time.perf_counter()
-                        await self._handle(msg)
+                        await self._handle_binance(msg)
+                        self._latency_ms = (time.perf_counter() - t0) * 1000
+            except websockets.exceptions.InvalidStatus as e:
+                status = getattr(e.response, "status_code", None)
+                if status == 451:
+                    logger.warning("⚠️  Binance blocked (HTTP 451 — geo-restriction)")
+                    return True  # signal: switch to Kraken
+                attempts += 1
+                logger.warning(f"Binance rejected (HTTP {status}) — retry {attempts} in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+            except Exception as e:
+                attempts += 1
+                logger.warning(f"Binance feed error: {e} — retry {attempts} in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+        return False
+
+    async def _connect_kraken(self):
+        """Connect to Kraken WebSocket — accessible globally, no geo-block."""
+        backoff = self.cfg.ws_reconnect_delay
+        while self._running:
+            try:
+                logger.info("📡 Connecting to Kraken BTC/USD feed...")
+                async with websockets.connect(self.cfg.kraken_ws_url, ping_interval=20) as ws:
+                    # Subscribe to ticker channel
+                    await ws.send(json.dumps({
+                        "event": "subscribe",
+                        "pair": ["XBT/USD"],
+                        "subscription": {"name": "ticker"}
+                    }))
+                    logger.success("✅ Kraken feed connected")
+                    backoff = self.cfg.ws_reconnect_delay
+                    async for msg in ws:
+                        t0 = time.perf_counter()
+                        await self._handle_kraken(msg)
                         self._latency_ms = (time.perf_counter() - t0) * 1000
             except Exception as e:
-                logger.warning(f"Binance feed error: {e} — reconnecting in {self.cfg.ws_reconnect_delay}s")
-                await asyncio.sleep(self.cfg.ws_reconnect_delay)
+                logger.warning(f"Kraken feed error: {e} — reconnecting in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
-    async def _handle(self, raw: str):
+    async def _handle_binance(self, raw: str):
         try:
             data = json.loads(raw)
-            price = float(data.get("c", 0))  # 'c' = current price in Binance ticker
+            price = float(data.get("c", 0))  # 'c' = last price in Binance ticker
             if price <= 0:
                 return
-
-            self._price_history.append(price)
-
-            # Calculate momentum
-            change_1m = 0.0
-            change_5m = 0.0
-            hist = list(self._price_history)
-            if len(hist) >= 60:
-                change_1m = (price - hist[-60]) / hist[-60]
-            if len(hist) >= 300:
-                change_5m = (price - hist[0]) / hist[0]
-
-            self.current = BTCPrice(
-                price=price,
-                timestamp=time.time(),
-                change_1m=change_1m,
-                change_5m=change_5m,
-                volume=float(data.get("v", 0))
-            )
+            self._update_price(price, volume=float(data.get("v", 0)))
         except Exception as e:
-            logger.debug(f"Price parse error: {e}")
+            logger.debug(f"Binance parse error: {e}")
+
+    async def _handle_kraken(self, raw: str):
+        try:
+            data = json.loads(raw)
+            # Kraken ticker format: [channelID, {"c": ["price", "qty"], ...}, "ticker", "XBT/USD"]
+            if not isinstance(data, list) or len(data) < 2:
+                return
+            ticker = data[1]
+            if not isinstance(ticker, dict) or "c" not in ticker:
+                return
+            price = float(ticker["c"][0])
+            if price <= 0:
+                return
+            volume = float(ticker.get("v", [0, 0])[1])  # 24h volume
+            self._update_price(price, volume=volume)
+        except Exception as e:
+            logger.debug(f"Kraken parse error: {e}")
+
+    def _update_price(self, price: float, volume: float = 0.0):
+        self._price_history.append(price)
+        hist = list(self._price_history)
+        change_1m = (price - hist[-60]) / hist[-60] if len(hist) >= 60 else 0.0
+        change_5m = (price - hist[0]) / hist[0] if len(hist) >= 300 else 0.0
+        self.current = BTCPrice(
+            price=price,
+            timestamp=time.time(),
+            change_1m=change_1m,
+            change_5m=change_5m,
+            volume=volume
+        )
 
     def stop(self):
         self._running = False
@@ -356,15 +428,21 @@ class PolymarketFeed:
 
     async def _ws_prices(self):
         """Subscribe to real-time price updates via Polymarket WebSocket."""
+        backoff = self.cfg.ws_reconnect_delay
         while self._running:
             try:
+                headers = {
+                    "Origin": "https://polymarket.com",
+                    "User-Agent": "Mozilla/5.0 (compatible; PolyBot/1.0)",
+                }
                 async with websockets.connect(
                     self.cfg.clob_ws_url,
+                    additional_headers=headers,
                     ping_interval=30
                 ) as ws:
                     logger.success("✅ Polymarket price feed connected")
+                    backoff = self.cfg.ws_reconnect_delay  # reset on success
 
-                    # Subscribe to all tracked markets
                     for cid in list(self.markets.keys()):
                         sub_msg = json.dumps({
                             "type": "subscribe",
@@ -376,9 +454,23 @@ class PolymarketFeed:
                     async for msg in ws:
                         await self._handle_price_update(msg)
 
+            except websockets.exceptions.InvalidStatus as e:
+                status = getattr(e.response, "status_code", None)
+                if status == 451:
+                    logger.error(
+                        "❌ Polymarket WebSocket blocked (HTTP 451 — geo-restriction). "
+                        "This region is not permitted to access Polymarket. "
+                        "Use a VPN or deploy on a VPS outside the restricted region. "
+                        "Stopping WebSocket — REST polling will continue."
+                    )
+                    return  # don't retry — it will never succeed without a VPN
+                logger.warning(f"Polymarket WS rejected (HTTP {status}): {e} — retrying in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)  # exponential backoff, cap at 60s
             except Exception as e:
-                logger.warning(f"Polymarket WS error: {e}")
-                await asyncio.sleep(self.cfg.ws_reconnect_delay)
+                logger.warning(f"Polymarket WS error: {e} — retrying in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     async def _handle_price_update(self, raw: str):
         try:
