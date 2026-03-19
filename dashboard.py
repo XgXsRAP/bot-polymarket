@@ -1,20 +1,11 @@
 """
-╔══════════════════════════════════════════╗
-║   POLYMARKET BTC BOT — RICH CLI DASHBOARD║
-║   Run: python dashboard.py               ║
-║   Bot must run in a separate terminal:   ║
-║   python bot.py --mode paper             ║
-╚══════════════════════════════════════════╝
+POLYMARKET BTC UP/DOWN — RICH TERMINAL DASHBOARD
+Run: python dashboard.py
 
-HOW IT WORKS:
-  bot.py  →  writes  →  data/bot_state.json   (every 1s)
-  dashboard reads bot_state.json and renders live
-  dashboard writes  →  data/bot_commands.json  (your keystrokes)
-  bot.py reads bot_commands.json and reacts
-
-KEYBOARD CONTROLS:
-  [p] Pause    [r] Resume    [s] Stop bot
-  [c] Toggle ClaudeAI        [q] Quit dashboard
+Keyboard controls:
+  [B] Buy UP      [S] Buy DOWN
+  [P] Pause bot   [R] Resume bot
+  [Q] Quit
 """
 
 import json
@@ -25,15 +16,18 @@ import termios
 import threading
 import time
 import tty
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+import requests
 from rich import box
 from rich.align import Align
-from rich.console import Console
-from rich.layout import Layout
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TaskID
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -41,10 +35,8 @@ from rich.text import Text
 STATE_FILE   = "data/bot_state.json"
 COMMAND_FILE = "data/bot_commands.json"
 TRADES_FILE  = "data/paper_trades.json"
-LOG_FILE     = "logs/bot.log"
 
 Path("data").mkdir(exist_ok=True)
-Path("logs").mkdir(exist_ok=True)
 
 console = Console()
 
@@ -52,48 +44,220 @@ console = Console()
 _running    = True
 _status_msg = ""
 
+ET = ZoneInfo("America/New_York")
 
 # ─────────────────────────────────────────────
-#  DATA HELPERS
+#  POLYMARKET + BTC DATA  (fetched in background)
 # ─────────────────────────────────────────────
 
-def load_state() -> dict:
+class MarketState:
+    """Thread-safe container for all live market data."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        # Market info
+        self.question        = "Fetching market..."
+        self.condition_id    = ""
+        self.end_ts          = 0.0
+        # Prices
+        self.up_bid          = 0.0
+        self.up_ask          = 0.0
+        self.down_bid        = 0.0
+        self.down_ask        = 0.0
+        self.price_to_beat   = 0.0   # BTC price at market open
+        self.btc_price       = 0.0
+        self.btc_ts          = 0.0
+        # Meta
+        self.last_poly_fetch = 0.0
+        self.last_btc_fetch  = 0.0
+        self.error           = ""
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return self.__dict__.copy()
+
+
+_mkt = MarketState()
+
+
+def _fetch_btc_price() -> float:
+    """Fetch current BTC/USDT price from Binance."""
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": "BTCUSDT"},
+            timeout=4,
+        )
+        return float(r.json()["price"])
+    except Exception:
+        return 0.0
+
+
+def _fetch_active_market() -> dict | None:
+    """
+    Find the currently active BTC Up/Down 5-min market on Polymarket.
+    Returns the best (soonest-expiring) market dict, or None.
+    """
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"active": "true", "limit": 200},
+            timeout=6,
+        )
+        markets = r.json()
+    except Exception as e:
+        return None
+
+    now = time.time()
+    candidates = []
+    for m in markets:
+        q = m.get("question", "").lower()
+        if not (("btc" in q or "bitcoin" in q) and ("up or down" in q or "5" in q)):
+            continue
+        end_date = m.get("endDate", "")
+        try:
+            end_ts = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        secs_left = end_ts - now
+        if 10 < secs_left < 360:          # only markets with <6 min left
+            candidates.append((secs_left, m))
+
+    if not candidates:
+        # Nothing imminent — grab the next upcoming one (smallest end_ts > now)
+        for m in markets:
+            q = m.get("question", "").lower()
+            if not (("btc" in q or "bitcoin" in q) and ("up or down" in q or "5" in q)):
+                continue
+            end_date = m.get("endDate", "")
+            try:
+                end_ts = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+            if end_ts > now:
+                candidates.append((end_ts - now, m))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def _fetch_clob_orderbook(token_id: str) -> tuple[float, float]:
+    """
+    Fetch best bid/ask from CLOB for a given token.
+    Returns (best_bid, best_ask).
+    """
+    try:
+        r = requests.get(
+            f"https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=4,
+        )
+        data = r.json()
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        best_bid = float(bids[0]["price"]) if bids else 0.0
+        best_ask = float(asks[0]["price"]) if asks else 0.0
+        return best_bid, best_ask
+    except Exception:
+        return 0.0, 0.0
+
+
+def _data_loop():
+    """Background thread: refreshes market data and BTC price."""
+    global _mkt
+    while _running:
+        now = time.time()
+
+        # ── BTC price — every 2 seconds ──
+        if now - _mkt.last_btc_fetch >= 2:
+            price = _fetch_btc_price()
+            with _mkt.lock:
+                if price > 0:
+                    _mkt.btc_price    = price
+                    _mkt.btc_ts       = now
+                    _mkt.last_btc_fetch = now
+                    # Set price_to_beat on first fetch for this market window
+                    if _mkt.price_to_beat == 0.0:
+                        _mkt.price_to_beat = price
+
+        # ── Polymarket market + orderbook — every 5 seconds ──
+        if now - _mkt.last_poly_fetch >= 5:
+            m = _fetch_active_market()
+            if m:
+                tokens    = m.get("tokens", [])
+                up_tok_id = ""
+                dn_tok_id = ""
+                up_price  = 0.0
+                dn_price  = 0.0
+
+                for tok in tokens:
+                    outcome = tok.get("outcome", "").upper()
+                    if outcome == "YES":
+                        up_tok_id = tok.get("token_id", "")
+                        up_price  = float(tok.get("price", 0.5))
+                    elif outcome == "NO":
+                        dn_tok_id = tok.get("token_id", "")
+                        dn_price  = float(tok.get("price", 0.5))
+
+                # Try CLOB orderbook for real bid/ask
+                up_bid, up_ask = (up_price, up_price)
+                dn_bid, dn_ask = (dn_price, dn_price)
+                if up_tok_id:
+                    b, a = _fetch_clob_orderbook(up_tok_id)
+                    if b > 0 or a > 0:
+                        up_bid, up_ask = b, a
+                if dn_tok_id:
+                    b, a = _fetch_clob_orderbook(dn_tok_id)
+                    if b > 0 or a > 0:
+                        dn_bid, dn_ask = b, a
+
+                end_date = m.get("endDate", "")
+                try:
+                    end_ts = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    end_ts = now + 300
+
+                # Reset price_to_beat when a new market window begins
+                old_cid = _mkt.condition_id
+                new_cid = m.get("conditionId", "")
+
+                with _mkt.lock:
+                    if new_cid != old_cid:
+                        # New market — reset anchor price
+                        _mkt.price_to_beat = _mkt.btc_price if _mkt.btc_price > 0 else 0.0
+                    _mkt.condition_id    = new_cid
+                    _mkt.question        = m.get("question", "")
+                    _mkt.end_ts          = end_ts
+                    _mkt.up_bid          = up_bid
+                    _mkt.up_ask          = up_ask
+                    _mkt.down_bid        = dn_bid
+                    _mkt.down_ask        = dn_ask
+                    _mkt.last_poly_fetch = now
+                    _mkt.error           = ""
+            else:
+                with _mkt.lock:
+                    _mkt.error = "No active BTC 5m market found"
+                    _mkt.last_poly_fetch = now
+
+        time.sleep(0.25)
+
+
+# ─────────────────────────────────────────────
+#  BOT STATE  (from shared JSON)
+# ─────────────────────────────────────────────
+
+def load_bot_state() -> dict:
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE) as f:
                 return json.load(f)
     except Exception:
         pass
-    return {
-        "running": False, "paused": False, "mode": "paper",
-        "capital": 1000.0, "start_capital": 1000.0,
-        "btc_price": 0.0, "btc_change_1m": 0.0, "btc_change_5m": 0.0,
-        "wins": 0, "losses": 0, "open_trades": [], "active_markets": [],
-        "markets_tracked": 0, "last_latency_ms": 0, "scan_count": 0,
-        "consecutive_losses": 0, "claude_enabled": False,
-        "claude_regime": "unknown", "claude_multiplier": 1.0,
-        "uptime_seconds": 0, "pnl_history": [], "last_updated": None,
-    }
-
-
-def load_trades() -> list:
-    try:
-        if os.path.exists(TRADES_FILE):
-            with open(TRADES_FILE) as f:
-                return json.load(f).get("closed", [])
-    except Exception:
-        pass
-    return []
-
-
-def load_logs(n: int = 22) -> list:
-    try:
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE) as f:
-                return f.readlines()[-n:]
-    except Exception:
-        pass
-    return []
+    return {"running": False, "paused": False, "mode": "paper",
+            "capital": 1000.0, "start_capital": 1000.0, "wins": 0, "losses": 0,
+            "open_trades": [], "uptime_seconds": 0}
 
 
 def send_command(cmd: dict):
@@ -105,414 +269,210 @@ def send_command(cmd: dict):
 
 
 # ─────────────────────────────────────────────
-#  FORMATTERS
+#  HELPERS
 # ─────────────────────────────────────────────
 
 def fmt_price(v: float) -> str:
     return f"${v:,.2f}"
 
 
-def fmt_pct(v: float, d: int = 3) -> str:
-    return f"{'+'if v >= 0 else ''}{v:.{d}f}%"
-
-
-def fmt_uptime(s: int) -> str:
-    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-
-
-def pnl_style(v: float) -> str:
-    return "bold green" if v >= 0 else "bold red"
-
-
-def _bar(pct: float, width: int = 18) -> Text:
-    filled = int(max(0, min(pct, 100)) / 100 * width)
-    color  = "green" if pct < 40 else ("yellow" if pct < 70 else "red")
-    t = Text()
-    t.append("[", style="dim")
-    t.append("█" * filled, style=color)
-    t.append("░" * (width - filled), style="dim")
-    t.append("]", style="dim")
-    return t
+def _parse_question_time(question: str) -> str:
+    """
+    Try to extract the time window from question like
+    'Bitcoin Up or Down - March 17, 11:20AM-11:25AM ET'
+    and return a clean label.
+    """
+    if not question:
+        return "BTC Up or Down"
+    # Strip 'Will ' prefix if present, keep as-is otherwise
+    q = question.replace("Will ", "").strip()
+    return q[:70]
 
 
 # ─────────────────────────────────────────────
-#  PANEL BUILDERS
+#  SCREEN BUILDER
 # ─────────────────────────────────────────────
 
-def build_header(state: dict) -> Panel:
-    mode    = state.get("mode", "paper").upper()
-    running = state.get("running", False)
-    paused  = state.get("paused", False)
-    uptime  = fmt_uptime(state.get("uptime_seconds", 0))
-    updated = state.get("last_updated", "—")
-    claude  = state.get("claude_enabled", False)
-    regime  = state.get("claude_regime", "unknown").upper()
-    mult    = state.get("claude_multiplier", 1.0)
+def build_screen(snap: dict, bot: dict) -> Group:
+    now     = time.time()
+    secs    = max(0.0, snap["end_ts"] - now)
+    total   = 300.0   # 5-min window
+    pct     = max(0.0, min(1.0, secs / total))
+
+    btc      = snap["btc_price"]
+    anchor   = snap["price_to_beat"]
+    diff     = btc - anchor
+    diff_pct = diff / anchor * 100 if anchor > 0 else 0.0
+
+    up_bid    = snap["up_bid"]
+    up_ask    = snap["up_ask"]
+    dn_bid    = snap["down_bid"]
+    dn_ask    = snap["down_ask"]
+    up_spread = up_ask - up_bid
+    dn_spread = dn_ask - dn_bid
+
+    direction = ">>> ABOVE <<<" if diff >= 0 else ">>> BELOW <<<"
+    dir_style = "bold green" if diff >= 0 else "bold red"
+
+    question_label = _parse_question_time(snap["question"])
+    mins  = int(secs) // 60
+    secs2 = int(secs) % 60
+
+    # ── Panel 1: Market header ──────────────────────────────────────
+    title_text = Text(justify="center")
+    title_text.append("  ")
+    title_text.append("₿", style="bold yellow")
+    title_text.append(f"  {question_label}", style="bold white")
+
+    header = Panel(
+        title_text,
+        box=box.DOUBLE_EDGE,
+        style="on grey7",
+        padding=(0, 1),
+    )
+
+    # ── Panel 2: Price comparison ────────────────────────────────────
+    price_table = Table(box=None, show_header=False, padding=(0, 2), expand=True)
+    price_table.add_column(width=20, style="dim")
+    price_table.add_column()
+
+    price_table.add_row(
+        Text("▶ PRICE TO BEAT", style="bold white"),
+        Text(fmt_price(anchor) if anchor > 0 else "—", style="bold yellow"),
+    )
+    price_table.add_row(
+        Text("B  CURRENT BTC",  style="bold cyan"),
+        Text(fmt_price(btc)   if btc    > 0 else "—", style="bold cyan"),
+    )
+
+    diff_val = Text()
+    diff_val.append(
+        f"{'+'if diff>=0 else ''}{fmt_price(diff)}  ({'+' if diff_pct>=0 else ''}{diff_pct:.3f}%)",
+        style="bold green" if diff >= 0 else "bold red",
+    )
+    price_table.add_row(Text("▼  DIFF", style="bold white"), diff_val)
+    price_table.add_row(Text(""), Text(direction, style=dir_style))
+
+    price_panel = Panel(price_table, box=box.SQUARE, style="on grey7", padding=(0, 2))
+
+    # ── Panel 3: UP / DOWN odds ──────────────────────────────────────
+    odds_table = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+    odds_table.add_column(width=6)
+    odds_table.add_column()
+
+    def odds_row(label: str, bid: float, ask: float, spread: float, color: str):
+        t = Text()
+        t.append(f"  Bid: ", style="dim"); t.append(f"${bid:.4f}", style=f"bold {color}")
+        t.append(f"  |  Ask: ", style="dim"); t.append(f"${ask:.4f}", style=f"bold {color}")
+        t.append(f"  |  Spread: ", style="dim"); t.append(f"${spread:.4f}", style=color)
+        return Text(label, style=f"bold {color}"), t
+
+    lbl, row = odds_row("● UP",   up_bid, up_ask, up_spread, "green")
+    odds_table.add_row(lbl, row)
+    lbl, row = odds_row("● DOWN", dn_bid, dn_ask, dn_spread, "red")
+    odds_table.add_row(lbl, row)
+
+    odds_panel = Panel(odds_table, box=box.SQUARE, style="on grey7", padding=(0, 2))
+
+    # ── Panel 4: Bot status strip ────────────────────────────────────
+    capital     = bot.get("capital", 1000.0)
+    start_cap   = bot.get("start_capital", 1000.0)
+    pnl         = capital - start_cap
+    wins        = bot.get("wins", 0)
+    losses      = bot.get("losses", 0)
+    mode        = bot.get("mode", "paper").upper()
+    running     = bot.get("running", False)
+    paused      = bot.get("paused", False)
+    open_n      = len(bot.get("open_trades", []))
+    uptime      = bot.get("uptime_seconds", 0)
+    uptime_str  = f"{uptime//3600:02d}:{(uptime%3600)//60:02d}:{uptime%60:02d}"
 
     if not running:
-        status, s_style = "● STOPPED", "bold red"
+        run_txt, run_col = "STOPPED", "red"
     elif paused:
-        status, s_style = "⏸ PAUSED",  "bold yellow"
+        run_txt, run_col = "PAUSED",  "yellow"
     else:
-        status, s_style = "▶ RUNNING", "bold green"
+        run_txt, run_col = "RUNNING", "green"
 
-    t = Text(justify="left")
-    t.append("  POLYBOT BTC  ", style="bold white on navy_blue")
-    t.append("  ")
-    t.append(f" {mode} ", style="bold white on blue")
-    t.append("  ")
-    t.append(status, style=s_style)
-    t.append(f"    uptime {uptime}", style="dim white")
-    t.append(f"    last update: {updated}", style="dim")
-    if claude:
-        t.append(f"    🤖 AI:{regime} {mult:.1f}x", style="bold magenta")
+    bot_line = Text()
+    bot_line.append(f" {mode} ", style="bold white on blue")
+    bot_line.append("  ")
+    bot_line.append(run_txt, style=f"bold {run_col}")
+    bot_line.append(f"  {uptime_str}  │  ", style="dim")
+    bot_line.append(f"Capital: {fmt_price(capital)}", style="bold white")
+    bot_line.append(f"  P&L: {'+'if pnl>=0 else ''}{pnl:.2f}", style="bold green" if pnl >= 0 else "bold red")
+    bot_line.append(f"  │  W:{wins}  L:{losses}  │  Open: {open_n}/3", style="dim")
+    if snap["error"]:
+        bot_line.append(f"  ⚠ {snap['error']}", style="yellow")
+
+    bot_panel = Panel(bot_line, box=box.SQUARE, style="on grey7", padding=(0, 1))
+
+    # ── Panel 5: CTA ────────────────────────────────────────────────
+    cta_text = Text(justify="center")
+    cta_text.append("READY TO BET!\n", style="bold yellow")
+    cta_text.append("  Press ", style="dim")
+    cta_text.append("[B]", style="bold green")
+    cta_text.append(" to buy UP   |   Press ", style="dim")
+    cta_text.append("[S]", style="bold red")
+    cta_text.append(" to buy DOWN", style="dim")
+
+    cta_panel = Panel(cta_text, box=box.SQUARE, style="on grey7", padding=(0, 2))
+
+    # ── Panel 6: Countdown ──────────────────────────────────────────
+    # Progress bar
+    bar_width   = 46
+    filled      = int(pct * bar_width)
+    empty       = bar_width - filled
+    bar_color   = "red" if secs < 30 else ("yellow" if secs < 60 else "green")
+
+    bar_text = Text()
+    bar_text.append("  TIME LEFT: ", style="bold white")
+    bar_text.append(f"{mins}:{secs2:02d}   ", style=f"bold {bar_color}")
+    bar_text.append("[", style="dim")
+    bar_text.append("█" * filled, style=bar_color)
+    bar_text.append("░" * empty,  style="dim")
+    bar_text.append("]", style="dim")
+
+    # Big clock on right
+    clock_text = Text(justify="right")
+    clock_text.append(f"{mins}:{secs2:02d}", style=f"bold {bar_color}")
+
+    timer_table = Table(box=None, show_header=False, padding=(0, 0), expand=True)
+    timer_table.add_column(ratio=3)
+    timer_table.add_column(ratio=1, justify="right")
+    timer_table.add_row(bar_text, Text(f"\n{mins}:{secs2:02d}", style=f"bold {bar_color} on grey7", justify="right"))
+
+    countdown_panel = Panel(timer_table, box=box.SQUARE, style="on grey7", padding=(0, 1))
+
+    # ── Panel 7: Controls ───────────────────────────────────────────
+    ctrl = Text(justify="center")
+    ctrl.append("[B]", style="bold green");   ctrl.append(" UP  ")
+    ctrl.append("[S]", style="bold red");     ctrl.append(" DOWN  ")
+    ctrl.append("[P]", style="bold yellow");  ctrl.append(" Pause  ")
+    ctrl.append("[R]", style="bold cyan");    ctrl.append(" Resume  ")
+    ctrl.append("[Q]", style="bold white");   ctrl.append(" Quit")
     if _status_msg:
-        t.append(f"    [{_status_msg}]", style="bold cyan")
+        ctrl.append(f"   [{_status_msg}]", style="bold cyan")
 
-    return Panel(t, box=box.HEAVY_HEAD, style="grey7", padding=(0, 0))
-
-
-def build_metrics(state: dict) -> Panel:
-    capital = state["capital"]
-    start   = state["start_capital"]
-    pnl     = capital - start
-    pnl_pct = pnl / start * 100 if start else 0
-    total   = state["wins"] + state["losses"]
-    wr      = state["wins"] / total * 100 if total else 0
-    btc     = state["btc_price"]
-    chg1m   = state["btc_change_1m"] * 100
-    chg5m   = state["btc_change_5m"] * 100
-    lat     = state.get("last_latency_ms", 0)
-    mkts    = state.get("markets_tracked", 0)
-    scans   = state.get("scan_count", 0)
-    open_n  = len(state.get("open_trades", []))
-    consec  = state.get("consecutive_losses", 0)
-
-    t = Table(box=None, show_header=False, padding=(0, 3), expand=True)
-    for _ in range(7):
-        t.add_column(justify="left")
-
-    t.add_row(
-        Text("CAPITAL",    style="dim"),
-        Text("BTC PRICE",  style="dim"),
-        Text("P&L",        style="dim"),
-        Text("WIN RATE",   style="dim"),
-        Text("LATENCY",    style="dim"),
-        Text("MARKETS",    style="dim"),
-        Text("STREAK",     style="dim"),
+    return Group(
+        header,
+        price_panel,
+        odds_panel,
+        bot_panel,
+        cta_panel,
+        countdown_panel,
+        Align.center(ctrl),
     )
-    t.add_row(
-        Text(fmt_price(capital),  style="bold white"),
-        Text(fmt_price(btc) if btc > 0 else "—",       style="bold cyan"),
-        Text(f"{'+'if pnl>=0 else ''}{pnl:.2f} ({fmt_pct(pnl_pct, 2)})", style=pnl_style(pnl)),
-        Text(f"{wr:.1f}%  ({total} trades)" if total else "—  (0 trades)", style="bold white"),
-        Text(f"{lat:.0f}ms", style="bold red" if lat > 100 else "bold green"),
-        Text(f"{mkts} active / {scans} scans", style="white"),
-        Text(f"{consec} losses" if consec else "—", style="bold red" if consec >= 3 else "dim"),
-    )
-    t.add_row(
-        Text(""),
-        Text(f"1m {fmt_pct(chg1m)}  5m {fmt_pct(chg5m)}", style=f"dim {'green' if chg1m >= 0 else 'red'}"),
-        Text(""),
-        Text(f"W:{state['wins']}  L:{state['losses']}", style="dim"),
-        Text("target <100ms", style="dim"),
-        Text(""),
-        Text(""),
-    )
-    return Panel(t, box=box.SIMPLE_HEAD, padding=(0, 1))
-
-
-def build_markets(state: dict) -> Panel:
-    markets = state.get("active_markets", [])
-    btc     = state.get("btc_price", 0.0)
-
-    if not markets:
-        body = Text("  Waiting for Polymarket data...", style="dim")
-        return Panel(body, title=f"[bold]LIVE MARKETS[/bold]  BTC {fmt_price(btc)}", border_style="blue", box=box.SIMPLE_HEAD)
-
-    t = Table(box=box.SIMPLE, show_header=True, header_style="dim", padding=(0, 1), expand=True)
-    t.add_column("SIG",  width=5,  justify="center")
-    t.add_column("QUESTION", min_width=28, max_width=42)
-    t.add_column("YES",  width=6,  justify="right")
-    t.add_column("NO",   width=6,  justify="right")
-    t.add_column("EDGE", width=8,  justify="right")
-    t.add_column("TIME", width=6,  justify="right")
-    t.add_column("●",    width=3,  justify="center")
-
-    for m in markets:
-        sig   = m.get("signal", "HOLD")
-        yes_p = m.get("yes_price", 0.5)
-        no_p  = m.get("no_price", 0.5)
-        edge  = m.get("edge_pct", 0.0)
-        secs  = m.get("seconds_to_expiry", 0)
-        q     = m.get("question", "")[:42]
-        in_p  = m.get("in_position", False)
-
-        sig_style  = "bold green" if sig == "YES" else ("bold red" if sig == "NO" else "dim")
-        time_style = "bold red"    if secs < 30   else ("yellow"   if secs < 60  else "green")
-        mins, srem = secs // 60, secs % 60
-
-        t.add_row(
-            Text(sig, style=sig_style),
-            Text(q, style="white" if in_p else "dim white"),
-            Text(f"{yes_p:.3f}", style="green"),
-            Text(f"{no_p:.3f}",  style="red"),
-            Text(f"{edge:+.3f}%", style="bold green" if edge > 0 else "dim red"),
-            Text(f"{mins}:{srem:02d}", style=time_style),
-            Text("●" if in_p else "·", style="magenta" if in_p else "dim"),
-        )
-
-    return Panel(t, title=f"[bold]LIVE MARKETS[/bold]  BTC {fmt_price(btc)}", border_style="blue", box=box.SIMPLE_HEAD)
-
-
-def build_positions(state: dict) -> Panel:
-    trades = state.get("open_trades", [])
-
-    if not trades:
-        return Panel(
-            Text("  No open positions.", style="dim"),
-            title="[bold]OPEN POSITIONS[/bold]",
-            border_style="blue", box=box.SIMPLE_HEAD,
-        )
-
-    t = Table(box=box.SIMPLE, show_header=True, header_style="dim", padding=(0, 1), expand=True)
-    t.add_column("SIDE",  width=4)
-    t.add_column("QUESTION", min_width=20, max_width=30)
-    t.add_column("ENTRY", width=7,  justify="right")
-    t.add_column("CUR",   width=7,  justify="right")
-    t.add_column("P&L",   width=10, justify="right")
-    t.add_column("HELD",  width=5,  justify="right")
-
-    for tr in trades:
-        side  = tr.get("side", "?")
-        q     = tr.get("question", "")[:30]
-        entry = tr.get("entry_price", 0)
-        cur   = tr.get("current_price", entry)
-        shrs  = tr.get("shares", 0)
-        pnl   = (cur - entry) * shrs
-        held  = int(time.time() - tr.get("entry_time", time.time()))
-
-        t.add_row(
-            Text(side, style="bold green" if side == "YES" else "bold red"),
-            Text(q, style="white"),
-            Text(f"{entry:.4f}", style="dim"),
-            Text(f"{cur:.4f}", style="cyan"),
-            Text(f"{'+'if pnl>=0 else ''}{pnl:.4f}", style=pnl_style(pnl)),
-            Text(f"{held}s", style="dim"),
-        )
-
-    return Panel(t, title="[bold]OPEN POSITIONS[/bold]", border_style="blue", box=box.SIMPLE_HEAD)
-
-
-def build_risk(state: dict) -> Panel:
-    capital  = state["capital"]
-    start    = state["start_capital"]
-    pnl_pct  = (capital - start) / start * 100 if start else 0
-    consec   = state.get("consecutive_losses", 0)
-    open_n   = len(state.get("open_trades", []))
-    daily_pct = min(abs(min(pnl_pct, 0)) / 2.0 * 100, 100)
-
-    t = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    t.add_column(width=13, style="dim")
-    t.add_column()
-    t.add_column(width=10, justify="right")
-
-    t.add_row(
-        "Daily loss",
-        _bar(daily_pct),
-        Text(f"{daily_pct:.0f}% / 2%", style="dim"),
-    )
-    t.add_row(
-        "Consec loss",
-        _bar(consec / 5 * 100),
-        Text(f"{consec}/5", style="bold red" if consec >= 3 else "dim"),
-    )
-    t.add_row(
-        "Positions",
-        _bar(open_n / 3 * 100),
-        Text(f"{open_n}/3", style="dim"),
-    )
-
-    alerts = Text()
-    if consec >= 5:
-        alerts.append("\n  ⚡ CIRCUIT BREAKER ACTIVE", style="bold red")
-    if pnl_pct <= -2.0:
-        alerts.append("\n  🛑 DAILY LOSS LIMIT HIT", style="bold red")
-
-    body = Text()
-    # We render the table into a group with the alerts below
-    from rich.console import Group
-    return Panel(
-        Group(t, alerts) if (consec >= 5 or pnl_pct <= -2.0) else t,
-        title="[bold]RISK METERS[/bold]",
-        border_style="yellow", box=box.SIMPLE_HEAD,
-    )
-
-
-def build_stats(trades: list, state: dict) -> Panel:
-    if not trades:
-        return Panel(
-            Text("  Stats appear after first closed trade.", style="dim"),
-            title="[bold]SESSION STATS[/bold]",
-            border_style="yellow", box=box.SIMPLE_HEAD,
-        )
-
-    pnls   = [tr.get("pnl", 0) for tr in trades]
-    wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    total  = len(pnls)
-    wr     = len(wins) / total * 100 if total else 0
-    pf     = abs(sum(wins) / sum(losses)) if losses and sum(losses) != 0 else float("inf")
-
-    # Go-live readiness checks
-    checks = [
-        ("Win rate > 52%",      wr >= 52,        f"{wr:.1f}%"),
-        ("Total trades > 50",   total >= 50,      str(total)),
-        ("No circuit breaker",  state.get("consecutive_losses", 0) < 5, "✓" if state.get("consecutive_losses", 0) < 5 else "✗"),
-        ("Profit factor > 1.5", pf >= 1.5,        f"{pf:.2f}" if pf != float("inf") else "∞"),
-    ]
-
-    t = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    t.add_column(width=16, style="dim")
-    t.add_column(justify="right")
-
-    t.add_row("Total P&L",     Text(f"${sum(pnls):+.4f}", style=pnl_style(sum(pnls))))
-    t.add_row("Avg win",       Text(f"${sum(wins)/len(wins):+.4f}" if wins else "—",     style="green"))
-    t.add_row("Avg loss",      Text(f"${sum(losses)/len(losses):+.4f}" if losses else "—", style="red"))
-    t.add_row("Best / Worst",  Text(f"${max(pnls):+.4f}  /  ${min(pnls):+.4f}" if pnls else "—", style="dim"))
-    t.add_row("Profit factor", Text(f"{pf:.2f}" if pf != float("inf") else "∞", style="bold green" if pf >= 1.5 else "yellow"))
-    t.add_row("", Text(""))
-    for label, passed, val in checks:
-        icon = "[green]✓[/green]" if passed else "[dim]○[/dim]"
-        t.add_row(f"  {label}", Text(f"[{icon}] {val}"))
-
-    return Panel(t, title=f"[bold]SESSION STATS[/bold]  {total} trades  {wr:.1f}% WR", border_style="yellow", box=box.SIMPLE_HEAD)
-
-
-def build_log() -> Panel:
-    lines = load_logs(22)
-    t = Text()
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        if "ERROR" in line:
-            t.append(line + "\n", style="red")
-        elif "SUCCESS" in line or "connected" in line.lower() or "✅" in line:
-            t.append(line + "\n", style="green")
-        elif "ENTER" in line:
-            t.append(line + "\n", style="bold green")
-        elif "EXIT" in line:
-            t.append(line + "\n", style="bold cyan")
-        elif "WARNING" in line or "RISK" in line or "circuit" in line.lower():
-            t.append(line + "\n", style="yellow")
-        elif "ClaudeBot" in line or "claude" in line.lower():
-            t.append(line + "\n", style="magenta")
-        elif "INFO" in line:
-            t.append(line + "\n", style="dim white")
-        else:
-            t.append(line + "\n", style="dim")
-
-    return Panel(t, title="[bold]SIGNAL LOG[/bold]", border_style="bright_black", box=box.SIMPLE_HEAD)
-
-
-def build_trades(trades: list) -> Panel:
-    if not trades:
-        return Panel(
-            Text("  No closed trades yet.", style="dim"),
-            title="[bold]RECENT TRADES[/bold]",
-            border_style="bright_black", box=box.SIMPLE_HEAD,
-        )
-
-    t = Table(box=box.SIMPLE, show_header=True, header_style="dim", padding=(0, 1), expand=True)
-    t.add_column("ID",    width=4,  justify="right")
-    t.add_column("SIDE",  width=4)
-    t.add_column("ENTRY", width=8,  justify="right")
-    t.add_column("EXIT",  width=8,  justify="right")
-    t.add_column("P&L",   width=10, justify="right")
-    t.add_column("P&L%",  width=8,  justify="right")
-    t.add_column("REASON", width=18)
-
-    for tr in reversed(trades[-18:]):
-        pnl     = tr.get("pnl", 0)
-        pnl_pct = tr.get("pnl_pct", 0) * 100
-        side    = tr.get("side", "?")
-        reason  = (tr.get("exit_reason", "") or "").replace("_", " ")[:18]
-        tid     = str(tr.get("trade_id", "?"))[-4:]
-
-        t.add_row(
-            Text(tid, style="dim"),
-            Text(side, style="bold green" if side == "YES" else "bold red"),
-            Text(f"{tr.get('entry_price', 0):.4f}", style="dim"),
-            Text(f"{tr.get('exit_price', 0):.4f}", style="dim"),
-            Text(f"{'+'if pnl >= 0 else ''}{pnl:.4f}", style=pnl_style(pnl)),
-            Text(fmt_pct(pnl_pct), style="green" if pnl_pct >= 0 else "red"),
-            Text(reason, style="dim"),
-        )
-
-    return Panel(
-        t,
-        title=f"[bold]RECENT TRADES[/bold]  last {min(18, len(trades))} of {len(trades)}",
-        border_style="bright_black", box=box.SIMPLE_HEAD,
-    )
-
-
-def build_controls(state: dict) -> Text:
-    claude = state.get("claude_enabled", False)
-    t = Text(justify="center")
-    t.append("[p]", style="bold yellow");  t.append(" Pause  ")
-    t.append("[r]", style="bold green");   t.append(" Resume  ")
-    t.append("[s]", style="bold red");     t.append(" Stop bot  ")
-    t.append("[c]", style="bold magenta"); t.append(f" Claude AI ({'ON' if claude else 'OFF'})  ")
-    t.append("[q]", style="bold white");   t.append(" Quit dashboard")
-    return t
-
-
-def build_screen(state: dict, trades: list) -> Layout:
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header",   size=3),
-        Layout(name="metrics",  size=6),
-        Layout(name="row_mid",  size=14),
-        Layout(name="row_bot",  size=20),
-        Layout(name="controls", size=1),
-    )
-
-    layout["row_mid"].split_row(
-        Layout(name="markets",   ratio=3),
-        Layout(name="positions", ratio=2),
-    )
-    layout["row_bot"].split_row(
-        Layout(name="risk_stats", ratio=1),
-        Layout(name="log",        ratio=2),
-        Layout(name="trades",     ratio=2),
-    )
-    layout["risk_stats"].split_column(
-        Layout(name="risk",  ratio=1),
-        Layout(name="stats", ratio=2),
-    )
-
-    layout["header"].update(build_header(state))
-    layout["metrics"].update(build_metrics(state))
-    layout["markets"].update(build_markets(state))
-    layout["positions"].update(build_positions(state))
-    layout["risk"].update(build_risk(state))
-    layout["stats"].update(build_stats(trades, state))
-    layout["log"].update(build_log())
-    layout["trades"].update(build_trades(trades))
-    layout["controls"].update(Align.center(build_controls(state)))
-
-    return layout
 
 
 # ─────────────────────────────────────────────
-#  KEYBOARD INPUT  (raw terminal, background thread)
+#  KEYBOARD  (raw terminal, background thread)
 # ─────────────────────────────────────────────
 
 def _keyboard_loop():
     global _running, _status_msg
     try:
-        fd = sys.stdin.fileno()
+        fd  = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
             tty.setraw(fd)
@@ -523,24 +483,22 @@ def _keyboard_loop():
                 ch = sys.stdin.read(1).lower()
                 if ch == "q":
                     _running = False
+                elif ch == "b":
+                    send_command({"action": "buy", "side": "YES"})
+                    _status_msg = "BUY UP sent"
+                elif ch == "s":
+                    send_command({"action": "buy", "side": "NO"})
+                    _status_msg = "BUY DOWN sent"
                 elif ch == "p":
                     send_command({"action": "pause"})
                     _status_msg = "pause sent"
                 elif ch == "r":
                     send_command({"action": "start"})
                     _status_msg = "resume sent"
-                elif ch == "s":
-                    send_command({"action": "stop"})
-                    _status_msg = "stop sent"
-                elif ch == "c":
-                    cur = load_state().get("claude_enabled", False)
-                    send_command({"action": "set_claude", "value": not cur})
-                    _status_msg = f"Claude AI {'OFF' if cur else 'ON'}"
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
     except Exception:
-        # Windows or non-TTY — keyboard input disabled, display-only mode
-        pass
+        pass   # non-TTY / Windows — display-only mode
 
 
 # ─────────────────────────────────────────────
@@ -550,18 +508,23 @@ def _keyboard_loop():
 def main():
     global _running
 
-    kb = threading.Thread(target=_keyboard_loop, daemon=True)
-    kb.start()
+    # Start background data thread
+    data_thread = threading.Thread(target=_data_loop, daemon=True)
+    data_thread.start()
 
-    with Live(console=console, screen=True, refresh_per_second=2) as live:
+    # Start keyboard thread
+    kb_thread = threading.Thread(target=_keyboard_loop, daemon=True)
+    kb_thread.start()
+
+    with Live(console=console, screen=True, refresh_per_second=4) as live:
         while _running:
-            state  = load_state()
-            trades = load_trades()
+            snap = _mkt.snapshot()
+            bot  = load_bot_state()
             try:
-                live.update(build_screen(state, trades))
+                live.update(build_screen(snap, bot))
             except Exception as e:
                 live.update(Panel(f"[red]Render error: {e}[/red]"))
-            time.sleep(0.5)
+            time.sleep(0.25)
 
     console.print("\n[dim]Dashboard closed.[/dim]\n")
 
