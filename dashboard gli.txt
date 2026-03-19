@@ -344,19 +344,25 @@ def render_sidebar(state: dict):
         # ── Bot controls ──
         st.markdown('<div class="section-label">Bot Controls</div>', unsafe_allow_html=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("▶ Start", use_container_width=True):
-                send_command({"action": "start"})
-                st.toast("Start command sent")
-        with col2:
-            if st.button("⏸ Pause", use_container_width=True):
-                send_command({"action": "pause"})
-                st.toast("Pause command sent")
+        bot_running = state.get("running", False)
 
-        if st.button("■ Stop Bot", use_container_width=True, type="secondary"):
-            send_command({"action": "stop"})
-            st.toast("Stop command sent", icon="🛑")
+        if not bot_running:
+            st.caption("▸ Start the bot first:")
+            st.code("python bot.py --mode paper", language="bash")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("▶ Resume", use_container_width=True, disabled=not state.get("paused", False)):
+                    send_command({"action": "start"})
+                    st.toast("Resumed")
+            with col2:
+                if st.button("⏸ Pause", use_container_width=True, disabled=state.get("paused", False)):
+                    send_command({"action": "pause"})
+                    st.toast("Paused")
+
+            if st.button("■ Stop Bot", use_container_width=True, type="secondary"):
+                send_command({"action": "stop"})
+                st.toast("Stop command sent", icon="🛑")
 
         st.markdown("---")
 
@@ -671,6 +677,87 @@ def render_win_rate_chart(trades: list):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def render_live_markets(state: dict):
+    """Terminal-style panel showing active markets with signal and countdown."""
+    markets = state.get("active_markets", [])
+    btc_price = state.get("btc_price", 0.0)
+
+    if not markets:
+        st.markdown('<div class="section-label">Live Markets</div>', unsafe_allow_html=True)
+        st.caption("No active BTC markets found — waiting for Polymarket data...")
+        return
+
+    st.markdown('<div class="section-label">Live Markets</div>', unsafe_allow_html=True)
+
+    for m in markets:
+        secs      = m.get("seconds_to_expiry", 0)
+        signal    = m.get("signal", "HOLD")
+        edge      = m.get("edge_pct", 0.0)
+        yes_p     = m.get("yes_price", 0.5)
+        no_p      = m.get("no_price", 0.5)
+        in_pos    = m.get("in_position", False)
+        question  = m.get("question", "")[:52]
+        conf      = m.get("confidence", 0.0)
+
+        # Colors
+        sig_color   = "#48bb78" if signal == "YES" else ("#fc8181" if signal == "NO" else "#4a5568")
+        time_color  = "#fc8181" if secs < 30 else ("#ed8936" if secs < 60 else "#48bb78")
+        pos_badge   = '<span style="color:#a78bfa;font-size:9px;font-weight:700"> ● IN POSITION</span>' if in_pos else ""
+
+        # Time bar (270s max window)
+        bar_total = 300
+        bar_filled = max(0, min(secs, bar_total))
+        bar_pct = bar_filled / bar_total * 100
+        bar_color = time_color
+
+        # Direction arrow
+        direction = "▲ YES" if signal == "YES" else ("▼ NO" if signal == "NO" else "— HOLD")
+
+        mins = secs // 60
+        s_rem = secs % 60
+        time_str = f"{mins}:{s_rem:02d}"
+
+        st.markdown(f"""
+<div style="
+    background:#060809;
+    border:1px solid {'#276749' if signal != 'HOLD' else '#1e2530'};
+    border-radius:6px;
+    padding:10px 14px;
+    margin-bottom:8px;
+    font-family:'JetBrains Mono',monospace;
+">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <span style="color:#4a5568;font-size:9px;letter-spacing:0.1em">{question}</span>
+    {pos_badge}
+  </div>
+  <div style="display:flex;gap:24px;align-items:flex-end;margin-bottom:8px">
+    <div>
+      <div style="color:#4a5568;font-size:8px;letter-spacing:0.12em;margin-bottom:2px">CURRENT BTC</div>
+      <div style="color:#e2e8f0;font-size:16px;font-weight:500">${btc_price:,.2f}</div>
+    </div>
+    <div>
+      <div style="color:#4a5568;font-size:8px;letter-spacing:0.12em;margin-bottom:2px">YES PROB</div>
+      <div style="color:#48bb78;font-size:16px;font-weight:500">{yes_p:.3f}</div>
+    </div>
+    <div>
+      <div style="color:#4a5568;font-size:8px;letter-spacing:0.12em;margin-bottom:2px">NO PROB</div>
+      <div style="color:#fc8181;font-size:16px;font-weight:500">{no_p:.3f}</div>
+    </div>
+    <div style="margin-left:auto;text-align:right">
+      <div style="color:#4a5568;font-size:8px;letter-spacing:0.12em;margin-bottom:2px">SIGNAL</div>
+      <div style="color:{sig_color};font-size:15px;font-weight:700">{direction}</div>
+      <div style="color:#4a5568;font-size:9px">edge {edge:+.3f}% · conf {conf:.0%}</div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:8px">
+    <span style="color:{time_color};font-size:11px;font-weight:700;min-width:36px">⏱ {time_str}</span>
+    <div style="flex:1;height:2px;background:#1e2530;border-radius:1px">
+      <div style="width:{bar_pct:.0f}%;height:2px;background:{bar_color};border-radius:1px;transition:width 1s linear"></div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+
 def render_momentum_gauge(state: dict):
     st.markdown('<div class="section-label">BTC Momentum</div>', unsafe_allow_html=True)
 
@@ -757,7 +844,7 @@ def render_exit_reason_chart(trades: list):
         reason = row["exit_reason"] or "unknown"
         color  = reason_colors.get(reason, "#4a5568")
         fig.add_trace(go.Bar(
-            name=reason,
+        streaame=reason,
             x=[reason.replace("_", " ")],
             y=[row["count"]],
             marker_color=color,
@@ -963,14 +1050,14 @@ def main():
     render_header(state)
     st.markdown("---")
 
-    # ── Row 1: P&L/Candle tabs + open positions ──
-    col_chart, col_open = st.columns([2, 1])
+    # ── Row 1: Live markets terminal + P&L/Candle tabs ──
+    col_markets, col_chart = st.columns([1, 2])
+    with col_markets:
+        render_live_markets(state)
+        render_momentum_gauge(state)
     with col_chart:
         render_pnl_chart(state, trades)
-    with col_open:
         render_open_trades(state)
-        st.markdown("---")
-        render_momentum_gauge(state)
 
     st.markdown("---")
 
