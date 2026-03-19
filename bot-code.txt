@@ -296,17 +296,20 @@ class BTCPriceFeed:
 
     async def _handle_binance(self, raw: str):
         try:
-            data = json.loads(raw)
+            data = json.loads(raw if isinstance(raw, str) else raw.decode())
             price = float(data.get("c", 0))  # 'c' = last price in Binance ticker
             if price <= 0:
                 return
+            first = self.current is None
             self._update_price(price, volume=float(data.get("v", 0)))
+            if first:
+                logger.info(f"💰 First BTC price from Binance: ${price:,.2f}")
         except Exception as e:
-            logger.debug(f"Binance parse error: {e}")
+            logger.warning(f"Binance parse error: {e} | raw={str(raw)[:80]}")
 
     async def _handle_kraken(self, raw: str):
         try:
-            data = json.loads(raw)
+            data = json.loads(raw if isinstance(raw, str) else raw.decode())
             # Kraken ticker format: [channelID, {"c": ["price", "qty"], ...}, "ticker", "XBT/USD"]
             if not isinstance(data, list) or len(data) < 2:
                 return
@@ -316,10 +319,13 @@ class BTCPriceFeed:
             price = float(ticker["c"][0])
             if price <= 0:
                 return
+            first = self.current is None
             volume = float(ticker.get("v", [0, 0])[1])  # 24h volume
             self._update_price(price, volume=volume)
+            if first:
+                logger.info(f"💰 First BTC price from Kraken: ${price:,.2f}")
         except Exception as e:
-            logger.debug(f"Kraken parse error: {e}")
+            logger.warning(f"Kraken parse error: {e} | raw={str(raw)[:80]}")
 
     def _update_price(self, price: float, volume: float = 0.0):
         self._price_history.append(price)
@@ -1415,9 +1421,14 @@ async def main(mode: str):
     bot = PolymarketBot(cfg, mode=mode)
 
     # Graceful shutdown on Ctrl+C
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, bot.stop)
+    # add_signal_handler is Unix-only; on Windows use signal.signal() instead
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, bot.stop)
+    except (NotImplementedError, AttributeError):
+        # Windows — add_signal_handler not supported; Ctrl+C handled by KeyboardInterrupt
+        signal.signal(signal.SIGINT, lambda *_: bot.stop())
 
     try:
         await bot.start()
@@ -1452,4 +1463,8 @@ if __name__ == "__main__":
 ╚══════════════════════════════════════════╝
     """)
 
-    asyncio.run(main(args.mode))
+    # Windows: ProactorEventLoop has poor WebSocket support.
+    # SelectorEventLoop is required for reliable WebSocket connections.
+    loop = asyncio.SelectorEventLoop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(main(args.mode))
