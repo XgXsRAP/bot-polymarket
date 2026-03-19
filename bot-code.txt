@@ -95,7 +95,7 @@ class Config:
     ws_reconnect_delay: float = 1.0
 
     # ── API Endpoints ──
-    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     clob_rest_url: str = "https://clob.polymarket.com"
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     # Kraken is accessible globally (no geo-block). Binance is blocked in some regions.
@@ -456,17 +456,27 @@ class PolymarketFeed:
 
             except websockets.exceptions.InvalidStatus as e:
                 status = getattr(e.response, "status_code", None)
+                # Permanent errors — stop retrying, REST polling will continue
                 if status == 451:
                     logger.error(
-                        "❌ Polymarket WebSocket blocked (HTTP 451 — geo-restriction). "
-                        "This region is not permitted to access Polymarket. "
-                        "Use a VPN or deploy on a VPS outside the restricted region. "
-                        "Stopping WebSocket — REST polling will continue."
+                        "❌ Polymarket WS blocked (HTTP 451 — geo-restriction). "
+                        "Use a VPN. Falling back to REST polling (30s updates)."
                     )
-                    return  # don't retry — it will never succeed without a VPN
-                logger.warning(f"Polymarket WS rejected (HTTP {status}): {e} — retrying in {backoff:.0f}s")
+                    return
+                if status == 404:
+                    logger.error(
+                        "❌ Polymarket WS endpoint not found (HTTP 404). "
+                        "The WebSocket URL may have changed. "
+                        "Falling back to REST polling (30s updates) — bot continues normally."
+                    )
+                    return
+                if status in (403, 410):
+                    logger.error(f"❌ Polymarket WS permanent error (HTTP {status}) — falling back to REST polling.")
+                    return
+                # Transient errors — retry with backoff
+                logger.warning(f"Polymarket WS rejected (HTTP {status}) — retrying in {backoff:.0f}s")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)  # exponential backoff, cap at 60s
+                backoff = min(backoff * 2, 60)
             except Exception as e:
                 logger.warning(f"Polymarket WS error: {e} — retrying in {backoff:.0f}s")
                 await asyncio.sleep(backoff)
@@ -1171,6 +1181,27 @@ class PolymarketBot:
                         "question": contract.question if contract else "",
                     })
 
+                # Build active market signals for dashboard terminal panel
+                active_markets = self.poly_feed.get_active_markets()
+                markets_info = []
+                for m in active_markets[:5]:
+                    if btc:
+                        sig, edge, conf = self.signal_engine.generate_signal(m, btc)
+                    else:
+                        sig, edge, conf = Signal.HOLD, 0.0, 0.0
+                    in_position = any(t.condition_id == m.condition_id for t in self._open_trades.values())
+                    markets_info.append({
+                        "condition_id": m.condition_id,
+                        "question": m.question,
+                        "yes_price": round(m.yes_price, 4),
+                        "no_price": round(m.no_price, 4),
+                        "seconds_to_expiry": max(0, round(m.seconds_to_expiry)),
+                        "signal": sig.value,
+                        "edge_pct": round(edge * 100, 3),
+                        "confidence": round(conf, 3),
+                        "in_position": in_position,
+                    })
+
                 state = {
                     "running": self._running,
                     "paused": self._paused,
@@ -1183,7 +1214,8 @@ class PolymarketBot:
                     "wins": self.risk.wins_today,
                     "losses": self.risk.losses_today,
                     "open_trades": open_list,
-                    "markets_tracked": len(self.poly_feed.get_active_markets()),
+                    "active_markets": markets_info,
+                    "markets_tracked": len(active_markets),
                     "last_latency_ms": self.btc_feed.latency_ms,
                     "scan_count": self._scan_count,
                     "consecutive_losses": self.risk.consecutive_losses,
