@@ -364,15 +364,14 @@ class PolymarketFeed:
         while self._running:
             try:
                 url = f"{self.cfg.gamma_api_url}/markets"
-                params = {
-                    "tag": "bitcoin",
-                    "active": "true",
-                    "limit": 50
-                }
+                # Fetch without tag filter — broader search, then keyword-filter locally
+                params = {"active": "true", "limit": 100}
                 async with self._session.get(url, params=params) as resp:
                     if resp.status == 200:
                         markets_data = await resp.json()
                         await self._process_markets(markets_data)
+                    else:
+                        logger.warning(f"Gamma API returned HTTP {resp.status}")
             except Exception as e:
                 logger.warning(f"Market poll error: {e}")
             await asyncio.sleep(30)
@@ -380,11 +379,16 @@ class PolymarketFeed:
     async def _process_markets(self, markets_data):
         """Filter to BTC 5-min markets and update local cache."""
         new_count = 0
-        btc_keywords = ["btc", "bitcoin", "5 min", "5-min", "5min"]
+        # Broad keyword match — Polymarket uses various naming conventions
+        btc_keywords = ["btc", "bitcoin", "xbt"]
+        time_keywords = ["5 min", "5-min", "5min", "5m ", "5 m", "minute", "up or down"]
 
         for m in markets_data:
             question = m.get("question", "").lower()
-            if not any(kw in question for kw in btc_keywords):
+            # Must mention BTC and either a time indicator or be an up/down market
+            is_btc = any(kw in question for kw in btc_keywords)
+            is_timed = any(kw in question for kw in time_keywords)
+            if not is_btc or not is_timed:
                 continue
 
             cid = m.get("conditionId", "")
@@ -1278,6 +1282,9 @@ class PolymarketBot:
         markets = self.poly_feed.get_active_markets()
 
         if not markets:
+            total = len(self.poly_feed.markets)
+            if self._scan_count % 50 == 0:  # Log every ~5s
+                logger.debug(f"No tradeable markets (total tracked: {total}, need 30–300s to expiry)")
             return
 
         # Get AI market regime (async, cached)
@@ -1297,6 +1304,10 @@ class PolymarketBot:
             signal, edge, confidence = self.signal_engine.generate_signal(contract, btc)
 
             if signal == Signal.HOLD:
+                logger.debug(
+                    f"HOLD | edge={edge*100:.3f}% (need {self.cfg.min_edge_required*100:.1f}%) | "
+                    f"yes={contract.yes_price:.3f} | expiry={contract.seconds_to_expiry:.0f}s"
+                )
                 continue
 
             # Apply AI regime multiplier to confidence
