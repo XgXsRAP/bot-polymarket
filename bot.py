@@ -1293,7 +1293,9 @@ class PolymarketBot:
     async def _command_reader(self):
         """Read commands written by the dashboard (pause/stop/set_claude)."""
         cmd_file = f"{self.cfg.data_dir}/bot_commands.json"
-        last_ts: float = 0.0
+        # Ignore any commands that existed before this bot session started.
+        # This prevents stale stop/pause commands from a previous run killing the bot on startup.
+        last_ts: float = self._start_time
         while self._running:
             try:
                 if os.path.exists(cmd_file):
