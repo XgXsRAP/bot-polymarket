@@ -387,7 +387,7 @@ class PolymarketFeed:
         new_count = 0
         # Broad keyword match — Polymarket uses various naming conventions
         btc_keywords = ["btc", "bitcoin", "xbt"]
-        time_keywords = ["5 min", "5-min", "5min", "5m ", "5 m", "minute", "up or down"]
+        time_keywords = ["5 min", "5-min", "5min", "5m ", "5 m", "minute", "up or down", "higher", "lower"]
 
         for m in markets_data:
             question = m.get("question", "").lower()
@@ -431,10 +431,21 @@ class PolymarketFeed:
 
             if cid not in self.markets:
                 new_count += 1
+                logger.info(f"🎯 New market: '{m.get('question','')[:70]}' | expiry in {contract.seconds_to_expiry:.0f}s")
             self.markets[cid] = contract
 
-        if new_count > 0:
-            logger.info(f"🎯 Found {len(self.markets)} BTC markets ({new_count} new)")
+        # Purge expired markets from cache
+        expired = [cid for cid, m in self.markets.items() if m.seconds_to_expiry < 0]
+        for cid in expired:
+            del self.markets[cid]
+
+        total = len(self.markets)
+        active = len(self.get_active_markets())
+        if total == 0:
+            logger.warning("⚠️  No BTC markets matched keywords — Polymarket may not have 5-min BTC markets active right now")
+        elif active == 0 and total > 0:
+            expiries = [f"{m.seconds_to_expiry:.0f}s" for m in self.markets.values()]
+            logger.info(f"📋 {total} BTC markets tracked, 0 in active window | expiries: {', '.join(expiries[:5])}")
 
     async def _ws_prices(self):
         """Subscribe to real-time price updates via Polymarket WebSocket."""
@@ -512,10 +523,10 @@ class PolymarketFeed:
             pass
 
     def get_active_markets(self) -> list[MarketContract]:
-        """Return markets that haven't expired and are still tradeable."""
+        """Return markets that haven't expired and are still tradeable (30s–600s to expiry)."""
         return [
             m for m in self.markets.values()
-            if 30 < m.seconds_to_expiry < 300
+            if 30 < m.seconds_to_expiry < 600
         ]
 
     async def stop(self):
@@ -1290,7 +1301,8 @@ class PolymarketBot:
         if not markets:
             total = len(self.poly_feed.markets)
             if self._scan_count % 50 == 0:  # Log every ~5s
-                logger.debug(f"No tradeable markets (total tracked: {total}, need 30–300s to expiry)")
+                logger.info(f"⏳ Waiting for tradeable markets (tracked: {total}, need 30–600s to expiry)")
+            self._scan_count += 1
             return
 
         # Get AI market regime (async, cached)
