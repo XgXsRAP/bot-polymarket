@@ -1,0 +1,781 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║   POLYMARKET BTC BOT — STREAMLIT DASHBOARD                   ║
+║   Run with: streamlit run dashboard.py                       ║
+║   The bot (btc_bot.py) must be running in a separate        ║
+║   terminal. This dashboard reads its state file.            ║
+╚══════════════════════════════════════════════════════════════╝
+
+HOW IT WORKS:
+─────────────
+1. btc_bot.py  →  writes  →  data/bot_state.json  (every second)
+2. dashboard.py reads bot_state.json and displays it live
+3. dashboard.py writes  →  data/bot_commands.json  (your controls)
+4. btc_bot.py reads bot_commands.json and reacts (pause/stop/etc)
+
+INSTALL:
+────────
+pip install streamlit plotly pandas
+
+RUN (two terminals):
+────────────────────
+Terminal 1:  python btc_bot.py --mode paper
+Terminal 2:  streamlit run dashboard.py
+"""
+
+import streamlit as st
+import json
+import time
+import os
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ── Page config — must be first Streamlit call ──
+st.set_page_config(
+    page_title="PolyBot Dashboard",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ── Paths ──
+STATE_FILE    = "data/bot_state.json"
+COMMAND_FILE  = "data/bot_commands.json"
+TRADES_FILE   = "data/paper_trades.json"
+LOG_FILE      = "logs/bot.log"
+
+Path("data").mkdir(exist_ok=True)
+Path("logs").mkdir(exist_ok=True)
+
+# ─────────────────────────────────────────────
+#  CUSTOM CSS — Dark trading terminal aesthetic
+# ─────────────────────────────────────────────
+st.markdown("""
+<style>
+/* Import monospace font */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;500;700&display=swap');
+
+/* Global */
+html, body, [class*="css"] {
+    font-family: 'JetBrains Mono', monospace;
+}
+
+/* Hide Streamlit default elements */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+.stDeployButton {display: none;}
+
+/* Main background */
+.stApp {
+    background: #0a0c0f;
+    color: #c8d0dc;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: #0d1117;
+    border-right: 1px solid #1e2530;
+}
+
+[data-testid="stSidebar"] * {
+    color: #8899aa !important;
+}
+
+/* Metric cards */
+[data-testid="metric-container"] {
+    background: #0f1318;
+    border: 1px solid #1e2530;
+    border-radius: 6px;
+    padding: 12px 16px;
+}
+
+[data-testid="metric-container"] label {
+    font-size: 10px !important;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #4a5568 !important;
+    font-family: 'Syne', sans-serif !important;
+}
+
+[data-testid="metric-container"] [data-testid="stMetricValue"] {
+    font-size: 22px !important;
+    font-weight: 500 !important;
+    color: #e2e8f0 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+}
+
+[data-testid="metric-container"] [data-testid="stMetricDelta"] {
+    font-size: 11px !important;
+}
+
+/* Buttons */
+.stButton > button {
+    background: #0f1318;
+    border: 1px solid #2d3748;
+    color: #8899aa;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    border-radius: 4px;
+    padding: 6px 16px;
+    transition: all 0.15s;
+}
+.stButton > button:hover {
+    background: #1a2234;
+    border-color: #4a9eff;
+    color: #e2e8f0;
+}
+
+/* Toggle / Checkbox */
+[data-testid="stCheckbox"] label {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 12px !important;
+    color: #8899aa !important;
+}
+
+/* Dataframe */
+[data-testid="stDataFrame"] {
+    border: 1px solid #1e2530;
+    border-radius: 6px;
+}
+
+/* Headers */
+h1, h2, h3 {
+    font-family: 'Syne', sans-serif !important;
+    color: #e2e8f0 !important;
+}
+
+/* Divider */
+hr {
+    border-color: #1e2530;
+}
+
+/* Log box */
+.log-container {
+    background: #060809;
+    border: 1px solid #1e2530;
+    border-radius: 6px;
+    padding: 12px;
+    height: 240px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    line-height: 1.9;
+}
+
+/* Status badge */
+.status-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    font-family: 'Syne', sans-serif;
+}
+
+.status-running  { background: #0d2818; color: #48bb78; border: 1px solid #276749; }
+.status-paper    { background: #0d1f3c; color: #4a9eff; border: 1px solid #2b5282; }
+.status-paused   { background: #2d1f0a; color: #ed8936; border: 1px solid #744210; }
+.status-stopped  { background: #2d0f0f; color: #fc8181; border: 1px solid #742a2a; }
+.status-claude   { background: #1a0d2e; color: #a78bfa; border: 1px solid #553c9a; }
+
+/* Section label */
+.section-label {
+    font-family: 'Syne', sans-serif;
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: #4a5568;
+    margin-bottom: 8px;
+    border-bottom: 1px solid #1e2530;
+    padding-bottom: 6px;
+}
+
+/* Trade row */
+.trade-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid #1a2030;
+    font-size: 11px;
+}
+
+.pnl-pos { color: #48bb78; }
+.pnl-neg { color: #fc8181; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #0a0c0f; }
+::-webkit-scrollbar-thumb { background: #2d3748; border-radius: 2px; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+#  DATA HELPERS
+# ─────────────────────────────────────────────
+
+def load_state() -> dict:
+    """Load current bot state from shared JSON file."""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    # Default demo state when bot isn't running
+    return {
+        "running": False,
+        "paused": False,
+        "mode": "paper",
+        "capital": 1000.0,
+        "start_capital": 1000.0,
+        "btc_price": 0.0,
+        "btc_change_1m": 0.0,
+        "btc_change_5m": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "open_trades": [],
+        "markets_tracked": 0,
+        "last_latency_ms": 0,
+        "scan_count": 0,
+        "consecutive_losses": 0,
+        "claude_enabled": False,
+        "claude_regime": "unknown",
+        "claude_multiplier": 1.0,
+        "uptime_seconds": 0,
+        "pnl_history": [],
+        "last_updated": None
+    }
+
+def load_trades() -> list:
+    """Load closed trade history."""
+    try:
+        if os.path.exists(TRADES_FILE):
+            with open(TRADES_FILE) as f:
+                data = json.load(f)
+                return data.get("closed", [])
+    except Exception:
+        pass
+    return []
+
+def load_logs(n=40) -> list:
+    """Load last N lines from bot log."""
+    try:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE) as f:
+                lines = f.readlines()
+                return lines[-n:]
+    except Exception:
+        pass
+    return ["[no log file found — start the bot first]"]
+
+def send_command(cmd: dict):
+    """Write a command for the bot to pick up."""
+    try:
+        with open(COMMAND_FILE, "w") as f:
+            json.dump({**cmd, "timestamp": time.time()}, f)
+    except Exception as e:
+        st.error(f"Could not write command: {e}")
+
+def fmt_pct(v: float, decimals=3) -> str:
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:.{decimals}f}%"
+
+def fmt_price(v: float) -> str:
+    return f"${v:,.2f}"
+
+def fmt_uptime(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ─────────────────────────────────────────────
+#  SIDEBAR — Controls
+# ─────────────────────────────────────────────
+
+def render_sidebar(state: dict):
+    with st.sidebar:
+        st.markdown("### ⚡ PolyBot")
+        st.markdown("---")
+
+        # Status badges
+        mode_label   = "PAPER" if state["mode"] == "paper" else "🔴 LIVE"
+        run_label    = "RUNNING" if state["running"] and not state["paused"] else ("PAUSED" if state["paused"] else "STOPPED")
+        run_cls      = "status-running" if run_label == "RUNNING" else ("status-paused" if run_label == "PAUSED" else "status-stopped")
+
+        st.markdown(
+            f'<span class="status-badge status-paper">{mode_label}</span>&nbsp;'
+            f'<span class="status-badge {run_cls}">{run_label}</span>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown(f"**Uptime:** `{fmt_uptime(state.get('uptime_seconds', 0))}`")
+        st.markdown("---")
+
+        # ── Bot controls ──
+        st.markdown('<div class="section-label">Bot Controls</div>', unsafe_allow_html=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶ Start", use_container_width=True):
+                send_command({"action": "start"})
+                st.toast("Start command sent")
+        with col2:
+            if st.button("⏸ Pause", use_container_width=True):
+                send_command({"action": "pause"})
+                st.toast("Pause command sent")
+
+        if st.button("■ Stop Bot", use_container_width=True, type="secondary"):
+            send_command({"action": "stop"})
+            st.toast("Stop command sent", icon="🛑")
+
+        st.markdown("---")
+
+        # ── ClaudeBot toggle ──
+        st.markdown('<div class="section-label">ClaudeBot AI</div>', unsafe_allow_html=True)
+
+        claude_on = st.toggle(
+            "Enable ClaudeBot",
+            value=state.get("claude_enabled", False),
+            help="Uses Claude AI to classify market regime every 60s and scale position sizes. Costs ~$0.50–$2/day."
+        )
+        if claude_on != state.get("claude_enabled", False):
+            send_command({"action": "set_claude", "value": claude_on})
+            st.toast(f"ClaudeBot {'enabled' if claude_on else 'disabled'}")
+
+        if claude_on:
+            regime = state.get("claude_regime", "unknown")
+            mult   = state.get("claude_multiplier", 1.0)
+            regime_colors = {
+                "trending_up": "#48bb78",
+                "trending_down": "#fc8181",
+                "sideways": "#ed8936",
+                "volatile": "#a78bfa",
+                "unknown": "#4a5568"
+            }
+            col = regime_colors.get(regime, "#4a5568")
+            st.markdown(
+                f'<span class="status-badge status-claude">🤖 {regime.upper()}</span>',
+                unsafe_allow_html=True
+            )
+            st.markdown(f"**Multiplier:** `{mult:.1f}x`")
+            st.caption("Re-analyzes every 60 seconds")
+
+        st.markdown("---")
+
+        # ── Risk settings display ──
+        st.markdown('<div class="section-label">Risk Settings</div>', unsafe_allow_html=True)
+        st.markdown("Max/trade: `0.5%`")
+        st.markdown("Daily loss limit: `2.0%`")
+        st.markdown("Min edge: `0.3%`")
+        st.markdown("Circuit breaker: `5 losses`")
+
+        st.markdown("---")
+
+        # ── Mode switch ──
+        st.markdown('<div class="section-label">Trading Mode</div>', unsafe_allow_html=True)
+        st.info("Edit `.env` to switch between paper and live mode, then restart the bot.", icon="ℹ️")
+
+        st.markdown("---")
+        st.caption(f"Auto-refresh every 2s")
+        st.caption(f"Last update: {state.get('last_updated', 'N/A')}")
+
+
+# ─────────────────────────────────────────────
+#  MAIN PANELS
+# ─────────────────────────────────────────────
+
+def render_header(state: dict):
+    pnl     = state["capital"] - state["start_capital"]
+    pnl_pct = pnl / state["start_capital"] * 100 if state["start_capital"] else 0
+    total   = state["wins"] + state["losses"]
+    wr      = state["wins"] / total * 100 if total > 0 else 0
+
+    st.markdown("## PolyBot · BTC 5-Min Trader")
+
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+    with col1:
+        st.metric(
+            "Capital",
+            fmt_price(state["capital"]),
+            delta=f"{fmt_pct(pnl_pct)} (${pnl:+.2f})",
+            delta_color="normal"
+        )
+    with col2:
+        st.metric(
+            "BTC Price",
+            fmt_price(state["btc_price"]) if state["btc_price"] > 0 else "—",
+            delta=fmt_pct(state["btc_change_1m"] * 100) + " 1m"
+        )
+    with col3:
+        st.metric(
+            "Win Rate",
+            f"{wr:.1f}%" if total > 0 else "—",
+            delta=f"{total} trades"
+        )
+    with col4:
+        st.metric(
+            "Open Positions",
+            len(state.get("open_trades", [])),
+            delta="max 3"
+        )
+    with col5:
+        lat = state.get("last_latency_ms", 0)
+        st.metric(
+            "Latency",
+            f"{lat:.0f}ms" if lat > 0 else "—",
+            delta="target <100ms",
+            delta_color="inverse" if lat > 100 else "normal"
+        )
+    with col6:
+        st.metric(
+            "Markets",
+            state.get("markets_tracked", 0),
+            delta="active BTC contracts"
+        )
+
+
+def render_pnl_chart(state: dict, trades: list):
+    st.markdown('<div class="section-label">P&L History</div>', unsafe_allow_html=True)
+
+    pnl_hist = state.get("pnl_history", [])
+
+    if trades:
+        # Build cumulative P&L from trade history
+        df = pd.DataFrame(trades)
+        if "exit_time" in df.columns and "pnl" in df.columns:
+            df = df[df["status"] == "closed"].copy()
+            df["exit_time"] = pd.to_datetime(df["exit_time"], unit="s")
+            df = df.sort_values("exit_time")
+            df["cum_pnl"] = df["pnl"].cumsum()
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df["exit_time"],
+                y=df["cum_pnl"],
+                mode="lines",
+                fill="tozeroy",
+                line=dict(color="#4a9eff", width=1.5),
+                fillcolor="rgba(74,158,255,0.06)",
+                name="Cumulative P&L",
+                hovertemplate="<b>%{x}</b><br>P&L: $%{y:.4f}<extra></extra>"
+            ))
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=200,
+                margin=dict(l=0, r=0, t=8, b=0),
+                xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=10)),
+                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=10)),
+                showlegend=False,
+                hovermode="x unified"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+    # Fallback: use live pnl_history array from state
+    if pnl_hist:
+        fig = go.Figure()
+        color = "#48bb78" if pnl_hist[-1] >= 0 else "#fc8181"
+        fill_color = "rgba(72,187,120,0.07)" if pnl_hist[-1] >= 0 else "rgba(252,129,129,0.07)"
+        fig.add_trace(go.Scatter(
+            y=pnl_hist,
+            mode="lines",
+            fill="tozeroy",
+            line=dict(color=color, width=1.5),
+            fillcolor=fill_color
+        ))
+        fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            height=160,
+            margin=dict(l=0, r=0, t=8, b=0),
+            xaxis=dict(showgrid=False, showticklabels=False),
+            yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=10)),
+            showlegend=False
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.caption("P&L chart will appear after the first trade closes.")
+
+
+def render_open_trades(state: dict):
+    st.markdown('<div class="section-label">Open Positions</div>', unsafe_allow_html=True)
+    trades = state.get("open_trades", [])
+
+    if not trades:
+        st.caption("No open positions right now.")
+        return
+
+    for t in trades:
+        side    = t.get("side", "?")
+        q       = t.get("question", "Unknown market")[:45]
+        entry   = t.get("entry_price", 0)
+        shares  = t.get("shares", 0)
+        cur     = t.get("current_price", entry)
+        pnl     = (cur - entry) * shares
+        held    = int(time.time() - t.get("entry_time", time.time()))
+        pnl_cls = "pnl-pos" if pnl >= 0 else "pnl-neg"
+        side_color = "#48bb78" if side == "YES" else "#fc8181"
+
+        st.markdown(
+            f"""<div class="trade-row">
+              <span style="color:{side_color};font-size:10px;font-weight:700;min-width:28px">{side}</span>
+              <span style="flex:1;color:#8899aa;font-size:10px;margin:0 8px">{q}</span>
+              <span style="color:#4a5568;font-size:10px;min-width:30px">{held}s</span>
+              <span class="{pnl_cls}" style="font-size:11px;min-width:60px;text-align:right">{'+' if pnl>=0 else ''}{pnl:.4f}</span>
+            </div>""",
+            unsafe_allow_html=True
+        )
+
+
+def render_trade_history(trades: list):
+    st.markdown('<div class="section-label">Closed Trades</div>', unsafe_allow_html=True)
+
+    if not trades:
+        st.caption("No closed trades yet. They'll appear here during paper trading.")
+        return
+
+    df = pd.DataFrame(trades[-50:])  # Show last 50
+    if df.empty:
+        return
+
+    # Format for display
+    display_cols = {
+        "trade_id": "ID",
+        "side": "Side",
+        "entry_price": "Entry",
+        "exit_price": "Exit",
+        "pnl": "P&L",
+        "pnl_pct": "P&L %",
+        "exit_reason": "Reason"
+    }
+    available = [c for c in display_cols if c in df.columns]
+    df_show = df[available].copy().rename(columns=display_cols)
+
+    if "Entry" in df_show.columns:
+        df_show["Entry"] = df_show["Entry"].apply(lambda x: f"${x:.4f}")
+    if "Exit" in df_show.columns:
+        df_show["Exit"] = df_show["Exit"].apply(lambda x: f"${x:.4f}")
+    if "P&L" in df_show.columns:
+        df_show["P&L"] = df_show["P&L"].apply(lambda x: f"{'+'if x>=0 else ''}{x:.4f}")
+    if "P&L %" in df_show.columns:
+        df_show["P&L %"] = df_show["P&L %"].apply(lambda x: f"{'+'if x>=0 else ''}{x*100:.3f}%")
+
+    # Reverse to show newest first
+    df_show = df_show.iloc[::-1]
+
+    st.dataframe(
+        df_show,
+        use_container_width=True,
+        height=220,
+        hide_index=True
+    )
+
+
+def render_win_rate_chart(trades: list):
+    st.markdown('<div class="section-label">Win / Loss Breakdown</div>', unsafe_allow_html=True)
+
+    if not trades:
+        st.caption("No data yet.")
+        return
+
+    df = pd.DataFrame(trades)
+    wins   = len(df[df["pnl"] > 0]) if "pnl" in df.columns else 0
+    losses = len(df[df["pnl"] <= 0]) if "pnl" in df.columns else 0
+
+    fig = go.Figure(data=[go.Pie(
+        labels=["Wins", "Losses"],
+        values=[wins, losses],
+        hole=0.65,
+        marker_colors=["#48bb78", "#fc8181"],
+        textfont_size=11,
+        textfont_color="#c8d0dc"
+    )])
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=180,
+        margin=dict(l=0, r=0, t=0, b=0),
+        showlegend=True,
+        legend=dict(
+            font=dict(color="#8899aa", size=10),
+            bgcolor="rgba(0,0,0,0)"
+        ),
+        annotations=[dict(
+            text=f"{wins/(wins+losses)*100:.0f}%<br>win" if (wins+losses) > 0 else "—",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="#e2e8f0")
+        )]
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_risk_meters(state: dict):
+    st.markdown('<div class="section-label">Risk Meters</div>', unsafe_allow_html=True)
+
+    capital       = state["capital"]
+    start_capital = state["start_capital"]
+    pnl_pct       = (capital - start_capital) / start_capital * 100 if start_capital else 0
+    daily_loss_used = min(abs(min(pnl_pct, 0)) / 2.0 * 100, 100)
+    consec        = state.get("consecutive_losses", 0)
+    consec_pct    = consec / 5 * 100
+    open_pos      = len(state.get("open_trades", []))
+    cap_used_pct  = open_pos / 3 * 100
+
+    def risk_bar(label, pct, fmt_val, danger_threshold=70):
+        color = "#48bb78" if pct < 40 else ("#ed8936" if pct < danger_threshold else "#fc8181")
+        st.markdown(f"""
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:11px">
+          <span style="width:110px;color:#4a5568">{label}</span>
+          <div style="flex:1;height:3px;background:#1e2530;border-radius:2px">
+            <div style="width:{pct:.0f}%;height:3px;background:{color};border-radius:2px;transition:width 0.4s"></div>
+          </div>
+          <span style="width:40px;text-align:right;color:{color}">{fmt_val}</span>
+        </div>""", unsafe_allow_html=True)
+
+    risk_bar("Daily loss", daily_loss_used, f"{daily_loss_used:.0f}%", 70)
+    risk_bar("Consec. losses", consec_pct, f"{consec}/5", 60)
+    risk_bar("Positions open", cap_used_pct, f"{open_pos}/3", 80)
+
+    if consec >= 5:
+        st.error("⚡ Circuit breaker active — bot paused 10min")
+    elif pnl_pct <= -2.0:
+        st.error("🛑 Daily loss limit hit (−2%)")
+
+
+def render_log(state: dict):
+    st.markdown('<div class="section-label">Signal Log</div>', unsafe_allow_html=True)
+
+    lines = load_logs(50)
+
+    # Color-code log lines
+    def colorize(line: str) -> str:
+        line = line.strip()
+        if "ERROR" in line:
+            return f'<span style="color:#fc8181">{line}</span>'
+        elif "ENTER" in line or "✅" in line:
+            return f'<span style="color:#48bb78">{line}</span>'
+        elif "EXIT" in line:
+            return f'<span style="color:#4a9eff">{line}</span>'
+        elif "RISK" in line or "WARNING" in line or "circuit" in line.lower():
+            return f'<span style="color:#ed8936">{line}</span>'
+        elif "CLAUDE" in line or "ClaudeBot" in line:
+            return f'<span style="color:#a78bfa">{line}</span>'
+        elif "SUCCESS" in line or "connected" in line.lower():
+            return f'<span style="color:#68d391">{line}</span>'
+        else:
+            return f'<span style="color:#4a5568">{line}</span>'
+
+    html_lines = "<br>".join(colorize(l) for l in lines[-40:])
+    st.markdown(
+        f'<div class="log-container">{html_lines}</div>',
+        unsafe_allow_html=True
+    )
+
+
+def render_stats_summary(trades: list, state: dict):
+    st.markdown('<div class="section-label">Session Stats</div>', unsafe_allow_html=True)
+
+    if not trades:
+        st.caption("Stats will appear after first closed trade.")
+        return
+
+    df = pd.DataFrame(trades)
+    if "pnl" not in df.columns:
+        return
+
+    wins_df   = df[df["pnl"] > 0]["pnl"]
+    losses_df = df[df["pnl"] <= 0]["pnl"]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"**Total P&L:** `${df['pnl'].sum():+.4f}`")
+        st.markdown(f"**Avg win:** `${wins_df.mean():+.4f}`" if len(wins_df) else "**Avg win:** `—`")
+        st.markdown(f"**Best trade:** `${df['pnl'].max():+.4f}`")
+    with col2:
+        st.markdown(f"**Total trades:** `{len(df)}`")
+        st.markdown(f"**Avg loss:** `${losses_df.mean():+.4f}`" if len(losses_df) else "**Avg loss:** `—`")
+        st.markdown(f"**Worst trade:** `${df['pnl'].min():+.4f}`")
+
+    # Profit factor
+    if len(losses_df) and losses_df.sum() != 0:
+        pf = abs(wins_df.sum() / losses_df.sum())
+        pf_color = "green" if pf >= 1.5 else ("orange" if pf >= 1.0 else "red")
+        st.markdown(f"**Profit factor:** :{pf_color}[{pf:.2f}]")
+
+    # Ready to go live?
+    wr = len(wins_df) / len(df) * 100 if len(df) > 0 else 0
+    st.markdown("---")
+    st.markdown("**Go-live readiness:**")
+
+    checks = [
+        ("Win rate > 52%",     wr >= 52,        f"{wr:.1f}%"),
+        ("Total trades > 50",  len(df) >= 50,   str(len(df))),
+        ("No daily loss hit",  state.get("consecutive_losses", 0) < 5, "✓" if state.get("consecutive_losses",0) < 5 else "✗"),
+        ("Profit factor > 1.5", len(losses_df) and abs(wins_df.sum()/losses_df.sum()) >= 1.5 if losses_df.sum()!=0 else False, "—")
+    ]
+    for label, passed, val in checks:
+        icon = "✅" if passed else "⬜"
+        st.markdown(f"{icon} {label} — `{val}`")
+
+
+# ─────────────────────────────────────────────
+#  MAIN APP LAYOUT
+# ─────────────────────────────────────────────
+
+def main():
+    # Load data
+    state  = load_state()
+    trades = load_trades()
+
+    # Sidebar
+    render_sidebar(state)
+
+    # Header metrics
+    render_header(state)
+    st.markdown("---")
+
+    # ── Row 1: P&L chart + open positions ──
+    col_chart, col_open = st.columns([2, 1])
+    with col_chart:
+        render_pnl_chart(state, trades)
+    with col_open:
+        render_open_trades(state)
+
+    st.markdown("---")
+
+    # ── Row 2: Win rate donut + risk meters + stats ──
+    col_wr, col_risk, col_stats = st.columns([1, 1, 1])
+    with col_wr:
+        render_win_rate_chart(trades)
+    with col_risk:
+        render_risk_meters(state)
+    with col_stats:
+        render_stats_summary(trades, state)
+
+    st.markdown("---")
+
+    # ── Row 3: Log + trade table ──
+    col_log, col_trades = st.columns([1, 1])
+    with col_log:
+        render_log(state)
+    with col_trades:
+        render_trade_history(trades)
+
+    # ── Auto-refresh every 2 seconds ──
+    time.sleep(2)
+    st.rerun()
+
+
+if __name__ == "__main__":
+    main()

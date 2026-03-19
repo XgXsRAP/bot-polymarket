@@ -1,0 +1,29 @@
+# ════════════════════════════════════════════════════
+# POLYMARKET BTC BOT — .env TEMPLATE
+# Copy this to: .env and fill in your values
+# NEVER commit .env to git!
+# ════════════════════════════════════════════════════
+
+# ── Polymarket API Keys (from polymarket.com → Profile → API) ──
+POLYMARKET_API_KEY=
+POLYMARKET_API_SECRET=
+POLYMARKET_API_PASSPHRASE=
+
+# ── Wallet (MetaMask → Export Private Key) ──
+POLYMARKET_PRIVATE_KEY=
+
+# ── Polygon RPC ──
+POLYGON_RPC_URL=https://polygon-rpc.com
+
+# ── Claude AI (optional — get from console.anthropic.com) ──
+ANTHROPIC_API_KEY=sk-ant-your_key_here
+CLAUDE_ENABLED=false
+
+# ── Trading Settings ──
+PAPER_TRADING=true          # Set to false ONLY after successful paper test
+INITIAL_CAPITAL=1000        # Starting capital in USD
+
+# ── Max trade size (USD) ──
+# Bot auto-calculates from 0.5% of capital
+# Override here if needed:
+# MAX_TRADE_USD=5
