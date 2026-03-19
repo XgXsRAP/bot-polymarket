@@ -1,29 +1,38 @@
-# ════════════════════════════════════════════════════
-# POLYMARKET BTC BOT — .env TEMPLATE
-# Copy this to: .env and fill in your values
-# NEVER commit .env to git!
-# ════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   POLYMARKET BTC BOT — ENVIRONMENT VARIABLES TEMPLATE       ║
+# ║   Copy this file to .env and fill in your values            ║
+# ║   NEVER commit .env to git — it contains private keys       ║
+# ╚══════════════════════════════════════════════════════════════╝
 
-# ── Polymarket API Keys (from polymarket.com → Profile → API) ──
+# ── TRADING MODE ──────────────────────────────────────────────
+# Keep PAPER_TRADING=true until you have validated the strategy.
+# Set to false ONLY when you are ready to use real money.
+PAPER_TRADING=true
+
+# Starting capital (USD) used for P&L calculations in paper mode.
+# In live mode this must match your actual USDC balance on Polygon.
+INITIAL_CAPITAL=1000
+
+# ── POLYMARKET API CREDENTIALS ────────────────────────────────
+# Obtain from: https://polymarket.com → Profile → API Keys
+# Required ONLY for live trading. Paper trading works without them.
 POLYMARKET_API_KEY=
 POLYMARKET_API_SECRET=
 POLYMARKET_API_PASSPHRASE=
 
-# ── Wallet (MetaMask → Export Private Key) ──
+# Your MetaMask / EVM wallet private key (Polygon network).
+# This signs orders on-chain. Keep it secret.
+# Required ONLY for live trading.
 POLYMARKET_PRIVATE_KEY=
 
-# ── Polygon RPC ──
+# Polygon RPC endpoint (default public endpoint is fine for testing).
+# For production use a paid RPC (Alchemy, QuickNode) to reduce latency.
 POLYGON_RPC_URL=https://polygon-rpc.com
 
-# ── Claude AI (optional — get from console.anthropic.com) ──
-ANTHROPIC_API_KEY=sk-ant-your_key_here
+# ── CLAUDE AI (OPTIONAL) ──────────────────────────────────────
+# Enables ClaudeBot market regime analysis.
+# Get your key from: https://console.anthropic.com
+# Estimated cost: ~$0.50–$2.00 per day at default settings.
+# Leave CLAUDE_ENABLED=false to disable (saves API costs).
+ANTHROPIC_API_KEY=
 CLAUDE_ENABLED=false
-
-# ── Trading Settings ──
-PAPER_TRADING=true          # Set to false ONLY after successful paper test
-INITIAL_CAPITAL=1000        # Starting capital in USD
-
-# ── Max trade size (USD) ──
-# Bot auto-calculates from 0.5% of capital
-# Override here if needed:
-# MAX_TRADE_USD=5
