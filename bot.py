@@ -40,6 +40,11 @@ except ImportError as e:
     print("Run: pip install websockets aiohttp loguru")
     sys.exit(1)
 
+# ── Strip newlines from proxy env vars (httpx rejects them) ──
+for _pkey in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+    if _pkey in os.environ:
+        os.environ[_pkey] = os.environ[_pkey].split("\n")[0].strip()
+
 # ── Optional: Polymarket CLOB client ──
 try:
     from py_clob_client.client import ClobClient
