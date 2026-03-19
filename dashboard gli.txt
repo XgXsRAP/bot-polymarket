@@ -317,25 +317,6 @@ def fetch_btc_candles(limit: int = 60) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=5)
-def fetch_btc_second_candles() -> pd.DataFrame:
-    """Fetch ~500 recent BTC trades from Binance and aggregate into 1-second candles."""
-    try:
-        url = "https://api.binance.com/api/v3/aggTrades"
-        resp = requests.get(url, params={"symbol": "BTCUSDT", "limit": 500}, timeout=5)
-        resp.raise_for_status()
-        trades = resp.json()
-        df = pd.DataFrame(trades)
-        df["price"] = df["p"].astype(float)
-        df["qty"]   = df["q"].astype(float)
-        df["time"]  = pd.to_datetime(df["T"], unit="ms").dt.floor("s")
-        ohlcv = df.groupby("time")["price"].agg(
-            open="first", high="max", low="min", close="last"
-        ).reset_index()
-        ohlcv["volume"] = df.groupby(df["time"])["qty"].sum().values
-        return ohlcv
-    except Exception:
-        return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────
@@ -370,13 +351,13 @@ def render_sidebar(state: dict):
             st.caption("▸ Start the bot first:")
             st.code("python bot.py --mode paper", language="bash")
         else:
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("▶ Resume", use_container_width=True, disabled=not state.get("paused", False)):
+            is_paused = state.get("paused", False)
+            if is_paused:
+                if st.button("▶ Resume", use_container_width=True):
                     send_command({"action": "start"})
                     st.toast("Resumed")
-            with col2:
-                if st.button("⏸ Pause", use_container_width=True, disabled=state.get("paused", False)):
+            else:
+                if st.button("⏸ Pause", use_container_width=True):
                     send_command({"action": "pause"})
                     st.toast("Paused")
 
@@ -491,163 +472,125 @@ def render_header(state: dict):
         )
 
 
-def render_candle_chart():
-    """BTC candle chart — 1-second or 1-minute, with expandable price range slider."""
-    tab_sec, tab_min = st.tabs(["BTC by Second", "BTC 1m"])
+def render_candle_chart(state: dict):
+    """BTC 1-minute candle chart with live price label on Y axis (TradingView style)."""
+    df = fetch_btc_candles(60)
+    btc_live = state.get("btc_price", 0.0)
 
-    with tab_sec:
-        df = fetch_btc_second_candles()
-        if df.empty:
-            st.caption("Could not fetch second-level data.")
-        else:
-            price_min = float(df["low"].min())
-            price_max = float(df["high"].max())
-            padding   = (price_max - price_min) * 0.1 or 50.0
+    if df.empty:
+        st.caption("Could not fetch BTC 1m candles — check internet connection.")
+        return
 
-            lo, hi = st.slider(
-                "Price range",
-                min_value=float(price_min - padding),
-                max_value=float(price_max + padding),
-                value=(float(price_min - padding * 0.2), float(price_max + padding * 0.2)),
-                step=1.0,
-                format="$%.0f",
-                key="sec_range"
-            )
-            fig = go.Figure(data=[go.Candlestick(
-                x=df["time"], open=df["open"], high=df["high"],
-                low=df["low"], close=df["close"],
-                increasing_line_color="#48bb78", decreasing_line_color="#fc8181",
-                increasing_fillcolor="rgba(72,187,120,0.35)",
-                decreasing_fillcolor="rgba(252,129,129,0.35)",
-            )])
-            fig.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                height=280, margin=dict(l=0, r=0, t=4, b=0),
-                xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=9), rangeslider_visible=False),
-                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568",
-                           tickprefix="$", tickfont=dict(size=9), range=[lo, hi]),
-                showlegend=False, hovermode="x unified"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    price_min = float(df["low"].min())
+    price_max = float(df["high"].max())
+    padding   = (price_max - price_min) * 0.15 or 100.0
 
-    with tab_min:
-        df = fetch_btc_candles(60)
-        if df.empty:
-            st.caption("Could not fetch candles.")
-        else:
-            price_min = float(df["low"].min())
-            price_max = float(df["high"].max())
-            padding   = (price_max - price_min) * 0.15 or 100.0
+    lo, hi = st.slider(
+        "Price range",
+        min_value=float(price_min - padding),
+        max_value=float(price_max + padding),
+        value=(float(price_min - padding * 0.1), float(price_max + padding * 0.1)),
+        step=1.0,
+        format="$%.0f",
+        key="min_range"
+    )
 
-            lo, hi = st.slider(
-                "Price range",
-                min_value=float(price_min - padding),
-                max_value=float(price_max + padding),
-                value=(float(price_min - padding * 0.1), float(price_max + padding * 0.1)),
-                step=1.0,
-                format="$%.0f",
-                key="min_range"
-            )
-            fig = go.Figure(data=[go.Candlestick(
-                x=df["time"], open=df["open"], high=df["high"],
-                low=df["low"], close=df["close"],
-                increasing_line_color="#48bb78", decreasing_line_color="#fc8181",
-                increasing_fillcolor="rgba(72,187,120,0.35)",
-                decreasing_fillcolor="rgba(252,129,129,0.35)",
-            )])
-            fig.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                height=280, margin=dict(l=0, r=0, t=4, b=0),
-                xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=9), rangeslider_visible=False),
-                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568",
-                           tickprefix="$", tickfont=dict(size=9), range=[lo, hi]),
-                showlegend=False, hovermode="x unified"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    fig = go.Figure(data=[go.Candlestick(
+        x=df["time"], open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"],
+        increasing_line_color="#48bb78", decreasing_line_color="#fc8181",
+        increasing_fillcolor="rgba(72,187,120,0.35)",
+        decreasing_fillcolor="rgba(252,129,129,0.35)",
+        name="BTC/USDT"
+    )])
+
+    # Live price horizontal line + label (TradingView style)
+    if btc_live > 0:
+        last_close = float(df["close"].iloc[-1])
+        line_color = "#48bb78" if btc_live >= last_close else "#fc8181"
+        fig.add_hline(
+            y=btc_live,
+            line_dash="dot",
+            line_color=line_color,
+            line_width=1.5,
+        )
+        fig.add_annotation(
+            x=1.0, y=btc_live,
+            xref="paper", yref="y",
+            text=f"  ${btc_live:,.2f}",
+            showarrow=False,
+            font=dict(size=10, color="#ffffff", family="JetBrains Mono"),
+            bgcolor=line_color,
+            bordercolor=line_color,
+            borderwidth=1,
+            borderpad=3,
+            xanchor="left",
+        )
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=320, margin=dict(l=0, r=80, t=4, b=0),
+        xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=9), rangeslider_visible=False),
+        yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568",
+                   tickprefix="$", tickfont=dict(size=9), range=[lo, hi]),
+        showlegend=False, hovermode="x unified"
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def render_pnl_chart(state: dict, trades: list):
-    tab_pnl, tab_btc = st.tabs(["P&L Curve", "BTC 1m (legacy)"])
+    st.markdown('<div class="section-label">P&L Curve</div>', unsafe_allow_html=True)
+    pnl_hist = state.get("pnl_history", [])
 
-    with tab_pnl:
-        pnl_hist = state.get("pnl_history", [])
-        if trades:
-            df = pd.DataFrame(trades)
-            if "exit_time" in df.columns and "pnl" in df.columns:
-                df = df[df["status"] == "closed"].copy()
-                df["exit_time"] = pd.to_datetime(df["exit_time"], unit="s")
-                df = df.sort_values("exit_time")
-                df["cum_pnl"] = df["pnl"].cumsum()
+    if trades:
+        df = pd.DataFrame(trades)
+        if "exit_time" in df.columns and "pnl" in df.columns:
+            df = df[df["status"] == "closed"].copy()
+            df["exit_time"] = pd.to_datetime(df["exit_time"], unit="s")
+            df = df.sort_values("exit_time")
+            df["cum_pnl"] = df["pnl"].cumsum()
+            last_val = float(df["cum_pnl"].iloc[-1])
+            line_color = "#48bb78" if last_val >= 0 else "#fc8181"
+            fill_color = "rgba(72,187,120,0.06)" if last_val >= 0 else "rgba(252,129,129,0.06)"
 
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=df["exit_time"],
-                    y=df["cum_pnl"],
-                    mode="lines",
-                    fill="tozeroy",
-                    line=dict(color="#4a9eff", width=1.5),
-                    fillcolor="rgba(74,158,255,0.06)",
-                    name="Cumulative P&L",
-                    hovertemplate="<b>%{x}</b><br>P&L: $%{y:.4f}<extra></extra>"
-                ))
-                fig.update_layout(
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    height=220,
-                    margin=dict(l=0, r=0, t=8, b=0),
-                    xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=10)),
-                    yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=10)),
-                    showlegend=False,
-                    hovermode="x unified"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        elif pnl_hist:
-            color = "#48bb78" if pnl_hist[-1] >= 0 else "#fc8181"
-            fill_color = "rgba(72,187,120,0.07)" if pnl_hist[-1] >= 0 else "rgba(252,129,129,0.07)"
             fig = go.Figure()
             fig.add_trace(go.Scatter(
-                y=pnl_hist, mode="lines", fill="tozeroy",
-                line=dict(color=color, width=1.5), fillcolor=fill_color
+                x=df["exit_time"], y=df["cum_pnl"],
+                mode="lines", fill="tozeroy",
+                line=dict(color=line_color, width=1.5),
+                fillcolor=fill_color,
+                hovertemplate="<b>%{x}</b><br>P&L: $%{y:.4f}<extra></extra>"
             ))
             fig.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                height=180, margin=dict(l=0, r=0, t=8, b=0),
-                xaxis=dict(showgrid=False, showticklabels=False),
-                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=10)),
-                showlegend=False
+                height=260, margin=dict(l=0, r=0, t=4, b=0),
+                xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=10)),
+                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568",
+                           tickprefix="$", tickfont=dict(size=10)),
+                showlegend=False, hovermode="x unified"
             )
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.caption("P&L chart will appear after the first trade closes.")
+            return
 
-    with tab_btc:
-        candles = fetch_btc_candles(30)
-        if candles.empty:
-            st.caption("Could not fetch BTC candles — check internet connection.")
-        else:
-            fig = go.Figure(data=[go.Candlestick(
-                x=candles["time"],
-                open=candles["open"],
-                high=candles["high"],
-                low=candles["low"],
-                close=candles["close"],
-                increasing_line_color="#48bb78",
-                decreasing_line_color="#fc8181",
-                increasing_fillcolor="rgba(72,187,120,0.3)",
-                decreasing_fillcolor="rgba(252,129,129,0.3)",
-                name="BTC/USDT"
-            )])
-            fig.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                height=220,
-                margin=dict(l=0, r=0, t=8, b=0),
-                xaxis=dict(showgrid=False, color="#4a5568", tickfont=dict(size=9), rangeslider_visible=False),
-                yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568", tickprefix="$", tickfont=dict(size=9)),
-                showlegend=False,
-                hovermode="x unified"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    if pnl_hist:
+        color = "#48bb78" if pnl_hist[-1] >= 0 else "#fc8181"
+        fill_color = "rgba(72,187,120,0.07)" if pnl_hist[-1] >= 0 else "rgba(252,129,129,0.07)"
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            y=pnl_hist, mode="lines", fill="tozeroy",
+            line=dict(color=color, width=1.5), fillcolor=fill_color
+        ))
+        fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            height=260, margin=dict(l=0, r=0, t=4, b=0),
+            xaxis=dict(showgrid=False, showticklabels=False),
+            yaxis=dict(showgrid=True, gridcolor="#1e2530", color="#4a5568",
+                       tickprefix="$", tickfont=dict(size=10)),
+            showlegend=False
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.caption("P&L chart will appear after the first trade closes.")
 
 
 def render_open_trades(state: dict):
@@ -1171,13 +1114,15 @@ def main():
     render_header(state)
     st.markdown("---")
 
-    # ── Row 1: Live markets + order book  |  BTC candles (seconds/1m) ──
-    col_left, col_candles = st.columns([1, 2])
+    # ── Row 1: Live markets + order book  |  BTC 1m candle  |  P&L + open positions ──
+    col_left, col_candles, col_pnl = st.columns([1, 1.6, 1])
     with col_left:
         render_live_markets(state)
         render_order_book(state)
     with col_candles:
-        render_candle_chart()
+        render_candle_chart(state)
+    with col_pnl:
+        render_pnl_chart(state, trades)
         render_open_trades(state)
 
     st.markdown("---")
@@ -1203,11 +1148,6 @@ def main():
         render_trade_history(trades)
     with col_hist:
         render_duration_histogram(trades)
-
-    st.markdown("---")
-
-    # ── Row 4: P&L curve (last, as requested) ──
-    render_pnl_chart(state, trades)
 
     # ── Auto-refresh every 2 seconds ──
     time.sleep(2)
