@@ -22,6 +22,14 @@ from enum import Enum
 from pathlib import Path
 from dotenv import load_dotenv
 
+# ── polybot2 signal data (CVD + liquidations) ──
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "polybot2"))
+try:
+    from hyperliquid_api import HyperliquidAPI as _HLApi
+    HL_AVAILABLE = True
+except ImportError:
+    HL_AVAILABLE = False
+
 # ── Try to import uvloop for faster event loop (Linux only) ──
 try:
     import uvloop
@@ -39,6 +47,11 @@ except ImportError as e:
     print(f"❌ Missing package: {e}")
     print("Run: pip install websockets aiohttp loguru")
     sys.exit(1)
+
+# ── Strip newlines from proxy env vars (httpx rejects them) ──
+for _pkey in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+    if _pkey in os.environ:
+        os.environ[_pkey] = os.environ[_pkey].split("\n")[0].strip()
 
 # ── Optional: Polymarket CLOB client ──
 try:
@@ -139,6 +152,8 @@ class MarketContract:
     no_price: float       # Current NO share price (0–1)
     expiry_ts: float      # Unix timestamp of market expiry
     last_updated: float = field(default_factory=time.time)
+    yes_token_id: str = ""   # CLOB token ID for YES side
+    no_token_id: str  = ""   # CLOB token ID for NO side
 
     @property
     def seconds_to_expiry(self) -> float:
@@ -201,6 +216,56 @@ def setup_logging(cfg: Config):
 
 
 # ═══════════════════════════════════════════════════════════
+#  CHAINLINK PRICE FEED (Polygon RPC — settlement source)
+# ═══════════════════════════════════════════════════════════
+
+class ChainlinkFeed:
+    """
+    Reads Chainlink BTC/USD directly from the Polygon aggregator contract.
+    This is the EXACT price source Polymarket uses to resolve UP/DOWN markets.
+    Updates every ~5s (Chainlink on Polygon updates when price moves >0.5%).
+    """
+    _RPC      = "https://1rpc.io/matic"
+    _CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+    _SELECTOR = "0x50d25bcd"  # latestAnswer()
+
+    def __init__(self):
+        self.price: float        = 0.0
+        self.last_updated: float = 0.0
+        self._running            = False
+
+    async def start(self):
+        self._running = True
+        logger.info("📡 ChainlinkFeed starting (Polygon RPC — settlement price)...")
+        async with aiohttp.ClientSession() as session:
+            while self._running:
+                try:
+                    payload = {
+                        "jsonrpc": "2.0", "method": "eth_call",
+                        "params": [{"to": self._CONTRACT, "data": self._SELECTOR}, "latest"],
+                        "id": 1,
+                    }
+                    async with session.post(
+                        self._RPC, json=payload,
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as r:
+                        data   = await r.json()
+                        result = data.get("result", "")
+                        if result and result != "0x" and "error" not in data:
+                            new_price = int(result, 16) / 1e8
+                            if new_price != self.price:
+                                logger.debug(f"⛓  Chainlink BTC/USD updated: ${new_price:,.2f}")
+                            self.price        = new_price
+                            self.last_updated = time.time()
+                except Exception as e:
+                    logger.debug(f"Chainlink feed error: {e}")
+                await asyncio.sleep(5)
+
+    def stop(self):
+        self._running = False
+
+
+# ═══════════════════════════════════════════════════════════
 #  BTC PRICE FEED (Binance WebSocket)
 # ═══════════════════════════════════════════════════════════
 
@@ -224,21 +289,20 @@ class BTCPriceFeed:
 
     async def connect(self):
         self._running = True
-        # Try Binance first — if geo-blocked, switch to Kraken permanently
-        binance_blocked = False
-        while self._running:
-            if binance_blocked:
-                await self._connect_kraken()
-            else:
-                blocked = await self._connect_binance()
-                if blocked:
-                    binance_blocked = True
-                    logger.warning("⚠️  Switching BTC feed to Kraken (globally accessible)")
+        # Try Binance first — if blocked/unreachable, switch to Kraken permanently.
+        # _connect_binance returns True when it gives up on Binance.
+        # _connect_kraken falls back to REST polling if WS is also blocked.
+        blocked = await self._connect_binance()
+        if blocked and self._running:
+            logger.warning("⚠️  Switching BTC feed to Kraken (globally accessible)")
+            await self._connect_kraken()
 
     async def _connect_binance(self) -> bool:
-        """Connect to Binance. Returns True if geo-blocked (caller should switch to Kraken)."""
+        """Connect to Binance. Returns True if blocked/unreachable (caller switches to Kraken)."""
         backoff = self.cfg.ws_reconnect_delay
         attempts = 0
+        # Switch to Kraken after this many consecutive failures (handles 403, IP bans, proxies)
+        MAX_ATTEMPTS = 4
         while self._running:
             try:
                 logger.info("📡 Connecting to Binance BTC/USDT feed...")
@@ -256,23 +320,39 @@ class BTCPriceFeed:
                         self._latency_ms = (time.perf_counter() - t0) * 1000
             except websockets.exceptions.InvalidStatus as e:
                 status = getattr(e.response, "status_code", None)
-                if status == 451:
-                    logger.warning("⚠️  Binance blocked (HTTP 451 — geo-restriction)")
-                    return True  # signal: switch to Kraken
+                # 451 = geo-block, 403 = IP/proxy block — both mean "try Kraken"
+                if status in (403, 451):
+                    logger.warning(f"⚠️  Binance blocked (HTTP {status}) — switching to Kraken")
+                    return True
                 attempts += 1
                 logger.warning(f"Binance rejected (HTTP {status}) — retry {attempts} in {backoff:.0f}s")
+                if attempts >= MAX_ATTEMPTS:
+                    logger.warning(f"⚠️  Binance unreachable after {attempts} attempts — switching to Kraken")
+                    return True
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             except Exception as e:
                 attempts += 1
-                logger.warning(f"Binance feed error: {e} — retry {attempts} in {backoff:.0f}s")
+                err = str(e)
+                logger.warning(f"Binance feed error: {err} — retry {attempts} in {backoff:.0f}s")
+                # Switch to Kraken on proxy rejection, connection refused, or DNS failure
+                if any(x in err for x in ("403", "Forbidden", "refused", "Name or service not known",
+                                           "Temporary failure", "host_not_allowed")):
+                    logger.warning("⚠️  Binance unreachable (network/proxy) — switching to Kraken")
+                    return True
+                if attempts >= MAX_ATTEMPTS:
+                    logger.warning(f"⚠️  Binance unreachable after {attempts} attempts — switching to Kraken")
+                    return True
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
         return False
 
     async def _connect_kraken(self):
-        """Connect to Kraken WebSocket — accessible globally, no geo-block."""
+        """Connect to Kraken WebSocket — accessible globally, no geo-block.
+        Falls back to REST polling if WebSocket is also blocked."""
         backoff = self.cfg.ws_reconnect_delay
+        attempts = 0
+        MAX_WS_ATTEMPTS = 4
         while self._running:
             try:
                 logger.info("📡 Connecting to Kraken BTC/USD feed...")
@@ -285,14 +365,46 @@ class BTCPriceFeed:
                     }))
                     logger.success("✅ Kraken feed connected")
                     backoff = self.cfg.ws_reconnect_delay
+                    attempts = 0
                     async for msg in ws:
                         t0 = time.perf_counter()
                         await self._handle_kraken(msg)
                         self._latency_ms = (time.perf_counter() - t0) * 1000
             except Exception as e:
-                logger.warning(f"Kraken feed error: {e} — reconnecting in {backoff:.0f}s")
+                attempts += 1
+                logger.warning(f"Kraken feed error: {e} — reconnecting in {backoff:.0f}s ({attempts}/{MAX_WS_ATTEMPTS})")
+                if attempts >= MAX_WS_ATTEMPTS:
+                    logger.warning("⚠️  Kraken WS unreachable — falling back to REST price polling")
+                    await self._poll_price_rest()
+                    return
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
+
+    async def _poll_price_rest(self):
+        """Last-resort BTC price via Kraken REST API — no WebSocket needed."""
+        url = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
+        backoff = 5.0
+        logger.info("📡 Starting Kraken REST price polling (fallback mode)...")
+        async with aiohttp.ClientSession() as session:
+            while self._running:
+                try:
+                    t0 = time.perf_counter()
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        data = await resp.json()
+                        result = data.get("result", {})
+                        ticker = result.get("XXBTZUSD") or result.get("XBTUSD", {})
+                        price = float(ticker["c"][0]) if ticker.get("c") else 0.0
+                        if price > 0:
+                            self._latency_ms = (time.perf_counter() - t0) * 1000
+                            first = self.current is None
+                            self._update_price(price)
+                            if first:
+                                logger.info(f"💰 First BTC price from Kraken REST: ${price:,.2f}")
+                        backoff = 5.0
+                except Exception as e:
+                    logger.warning(f"Kraken REST poll error: {e} — retry in {backoff:.0f}s")
+                    backoff = min(backoff * 2, 60)
+                await asyncio.sleep(backoff)
 
     async def _handle_binance(self, raw: str):
         try:
@@ -366,86 +478,86 @@ class PolymarketFeed:
         asyncio.create_task(self._ws_prices())
 
     async def _poll_markets(self):
-        """Discover active BTC 5-minute markets."""
+        """Discover active BTC 5m/15m markets via events endpoint."""
         while self._running:
             try:
-                url = f"{self.cfg.gamma_api_url}/markets"
-                # Fetch without tag filter — broader search, then keyword-filter locally
-                params = {"active": "true", "limit": 100}
+                url    = f"{self.cfg.gamma_api_url}/events"
+                params = {
+                    "active":    "true",
+                    "closed":    "false",
+                    "limit":     100,
+                    "order":     "endDate",
+                    "ascending": "true",
+                }
                 async with self._session.get(url, params=params) as resp:
                     if resp.status == 200:
-                        markets_data = await resp.json()
-                        await self._process_markets(markets_data)
+                        events = await resp.json()
+                        await self._process_events(events)
                     else:
                         logger.warning(f"Gamma API returned HTTP {resp.status}")
             except Exception as e:
                 logger.warning(f"Market poll error: {e}")
             await asyncio.sleep(30)
 
-    async def _process_markets(self, markets_data):
-        """Filter to BTC 5-min markets and update local cache."""
+    async def _process_events(self, events):
+        """Extract BTC up/down markets from events (5m and 15m windows)."""
         new_count = 0
-        # Broad keyword match — Polymarket uses various naming conventions
-        btc_keywords = ["btc", "bitcoin", "xbt"]
-        time_keywords = ["5 min", "5-min", "5min", "5m ", "5 m", "minute", "up or down", "higher", "lower"]
+        now       = time.time()
 
-        for m in markets_data:
-            question = m.get("question", "").lower()
-            # Must mention BTC and either a time indicator or be an up/down market
-            is_btc = any(kw in question for kw in btc_keywords)
-            is_timed = any(kw in question for kw in time_keywords)
-            if not is_btc or not is_timed:
+        for event in events:
+            slug = event.get("slug", "") or event.get("ticker", "")
+            if "btc-updown" not in slug:
+                continue
+            if event.get("closed") or not event.get("active"):
                 continue
 
-            cid = m.get("conditionId", "")
-            if not cid:
-                continue
+            for m in event.get("markets", []):
+                cid = m.get("conditionId", "")
+                if not cid:
+                    continue
 
-            # Parse market tokens (YES/NO prices)
-            tokens = m.get("tokens", [])
-            yes_price = 0.5
-            no_price = 0.5
-            for t in tokens:
-                outcome = t.get("outcome", "").upper()
-                if outcome == "YES":
-                    yes_price = float(t.get("price", 0.5))
-                elif outcome == "NO":
-                    no_price = float(t.get("price", 0.5))
+                # Parse expiry — skip already closed
+                try:
+                    expiry_ts = datetime.fromisoformat(
+                        m.get("endDate", "").replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    expiry_ts = now + 300
+                if expiry_ts <= now:
+                    continue
 
-            # Parse expiry
-            end_date = m.get("endDate", "")
-            try:
-                expiry_ts = datetime.fromisoformat(
-                    end_date.replace("Z", "+00:00")
-                ).timestamp()
-            except Exception:
-                expiry_ts = time.time() + 300  # Default 5 min
+                # YES/NO prices
+                try:
+                    prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
+                except Exception:
+                    prices = [0.5, 0.5]
+                yes_price = float(prices[0]) if prices else 0.5
+                no_price  = float(prices[1]) if len(prices) > 1 else round(1 - yes_price, 4)
 
-            contract = MarketContract(
-                condition_id=cid,
-                question=m.get("question", ""),
-                yes_price=yes_price,
-                no_price=no_price,
-                expiry_ts=expiry_ts
-            )
+                # Token IDs for live order placement
+                try:
+                    token_ids = json.loads(m.get("clobTokenIds", "[]"))
+                except Exception:
+                    token_ids = []
+                yes_token = str(token_ids[0]) if len(token_ids) > 0 else ""
+                no_token  = str(token_ids[1]) if len(token_ids) > 1 else ""
 
-            if cid not in self.markets:
-                new_count += 1
-                logger.info(f"🎯 New market: '{m.get('question','')[:70]}' | expiry in {contract.seconds_to_expiry:.0f}s")
-            self.markets[cid] = contract
+                contract = MarketContract(
+                    condition_id=cid,
+                    question=m.get("question", ""),
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    expiry_ts=expiry_ts,
+                    yes_token_id=yes_token,
+                    no_token_id=no_token,
+                )
 
-        # Purge expired markets from cache
-        expired = [cid for cid, m in self.markets.items() if m.seconds_to_expiry < 0]
-        for cid in expired:
-            del self.markets[cid]
+                if cid not in self.markets:
+                    new_count += 1
+                self.markets[cid] = contract
 
-        total = len(self.markets)
-        active = len(self.get_active_markets())
-        if total == 0:
-            logger.warning("⚠️  No BTC markets matched keywords — Polymarket may not have 5-min BTC markets active right now")
-        elif active == 0 and total > 0:
-            expiries = [f"{m.seconds_to_expiry:.0f}s" for m in self.markets.values()]
-            logger.info(f"📋 {total} BTC markets tracked, 0 in active window | expiries: {', '.join(expiries[:5])}")
+        if new_count > 0:
+            logger.info(f"🎯 Found {len(self.markets)} BTC markets ({new_count} new)")
 
     async def _ws_prices(self):
         """Subscribe to real-time price updates via Polymarket WebSocket."""
@@ -523,16 +635,121 @@ class PolymarketFeed:
             pass
 
     def get_active_markets(self) -> list[MarketContract]:
-        """Return markets that haven't expired and are still tradeable (30s–600s to expiry)."""
+        """Return markets that haven't expired and are still tradeable."""
         return [
             m for m in self.markets.values()
-            if 30 < m.seconds_to_expiry < 600
+            if 30 < m.seconds_to_expiry < 1200   # up to 20 min (covers 5m and 15m windows)
         ]
 
     async def stop(self):
         self._running = False
         if self._session:
             await self._session.close()
+
+
+# ═══════════════════════════════════════════════════════════
+#  ENHANCED SIGNAL FEED — CVD + Liquidations from polybot2
+# ═══════════════════════════════════════════════════════════
+
+class EnhancedSignalFeed:
+    """
+    Background task that polls Hyperliquid CVD and exchange liquidations.
+    Produces two floats updated every ~60s:
+      cvd_signal  : -1.0 (bearish div) … +1.0 (bullish div)
+      liq_signal  : -1.0 (long liqs dominate) … +1.0 (short liqs dominate)
+    """
+
+    def __init__(self):
+        self.cvd_signal: float = 0.0
+        self.liq_signal: float = 0.0
+        self._running = False
+        self._api = _HLApi() if HL_AVAILABLE else None
+        if not HL_AVAILABLE:
+            logger.warning("⚠️  polybot2/hyperliquid_api not found — running without CVD/liq signals")
+
+    async def start(self):
+        if not self._api:
+            return
+        self._running = True
+        logger.info("📡 EnhancedSignalFeed started (CVD + liquidations)")
+        while self._running:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._refresh)
+            except Exception as e:
+                logger.debug(f"EnhancedSignalFeed error: {e}")
+            await asyncio.sleep(60)
+
+    def _refresh(self):
+        self._update_cvd()
+        self._update_liquidations()
+
+    def _update_cvd(self):
+        """
+        Compute CVD over the last 15 1-min candles.
+        Bearish divergence (price up, CVD down) → -1.0
+        Bullish divergence (price down, CVD up) → +1.0
+        Aligned trend                            → ±0.3
+        No signal                                →  0.0
+        """
+        try:
+            candles = self._api.get_candles("BTC", "1m", lookback_hours=1)
+            if not candles or len(candles) < 15:
+                return
+            candles = candles[-15:]
+
+            prices  = [float(c.get("c", 0)) for c in candles]
+            volumes = [float(c.get("v", 0)) for c in candles]
+            opens   = [float(c.get("o", 0)) for c in candles]
+
+            # CVD: green bar = +vol, red bar = -vol
+            deltas = [v if c >= o else -v for c, o, v in zip(prices, opens, volumes)]
+            cvd_chg   = sum(deltas)
+            price_chg = (prices[-1] - prices[0]) / prices[0] * 100 if prices[0] else 0
+
+            if price_chg > 0.05 and cvd_chg < -50:
+                self.cvd_signal = -1.0   # bearish divergence
+            elif price_chg < -0.05 and cvd_chg > 50:
+                self.cvd_signal = 1.0    # bullish divergence
+            elif price_chg > 0.05 and cvd_chg > 50:
+                self.cvd_signal = 0.3    # aligned bull
+            elif price_chg < -0.05 and cvd_chg < -50:
+                self.cvd_signal = -0.3   # aligned bear
+            else:
+                self.cvd_signal = 0.0
+
+            logger.debug(f"CVD signal={self.cvd_signal:+.1f} price_chg={price_chg:+.3f}% cvd_chg={cvd_chg:+.0f}")
+        except Exception as e:
+            logger.debug(f"CVD update error: {e}")
+
+    def _update_liquidations(self):
+        """
+        Compare long vs short liquidations from Binance + OKX last batch.
+        More short liqs (forced short covering) → bullish  → +1.0
+        More long liqs  (forced long selling)   → bearish  → -1.0
+        """
+        try:
+            liqs = self._api.get_all_liquidations("1h")
+            if not liqs:
+                self.liq_signal = 0.0
+                return
+
+            long_usd  = sum(l["value"] for l in liqs if l.get("side") == "long")
+            short_usd = sum(l["value"] for l in liqs if l.get("side") == "short")
+            total     = long_usd + short_usd
+
+            if total == 0:
+                self.liq_signal = 0.0
+                return
+
+            # More long liqs → bearish pressure; more short liqs → bullish pressure
+            self.liq_signal = (short_usd - long_usd) / total
+            logger.debug(f"Liq signal={self.liq_signal:+.2f} long=${long_usd/1e6:.2f}M short=${short_usd/1e6:.2f}M")
+        except Exception as e:
+            logger.debug(f"Liq update error: {e}")
+
+    def stop(self):
+        self._running = False
 
 
 # ═══════════════════════════════════════════════════════════
@@ -553,36 +770,52 @@ class SignalEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    def calculate_fair_value(self, btc: BTCPrice) -> float:
+    def calculate_fair_value(
+        self,
+        btc: BTCPrice,
+        cvd_signal: float = 0.0,
+        liq_signal: float = 0.0,
+        chainlink_price: float = 0.0,
+    ) -> float:
         """
-        Estimate fair probability that BTC will be UP in 5 min.
-        Uses 1m and 5m momentum signals.
-        Returns value between 0.0 and 1.0.
+        Estimate fair probability that BTC will be UP at expiry.
+
+        Uses Chainlink as the anchor (settlement price) and Binance momentum
+        to predict which direction Chainlink will move next.
+
+        Components:
+          momentum  — Binance 1m/5m change vs Chainlink anchor  (0.50)
+          cvd       — CVD divergence from polybot2               (0.30)
+          liq       — liquidation pressure                       (0.20)
         """
-        # Baseline: 50% (no edge)
-        base = 0.50
+        # ── Use Chainlink as anchor if available, else fall back to Binance ──
+        anchor = chainlink_price if chainlink_price > 0 else btc.price
 
-        # 1-minute momentum contribution (stronger weight)
-        mom_1m = btc.change_1m
-        # 5-minute momentum contribution
-        mom_5m = btc.change_5m
+        # Momentum: how far has Binance moved vs Chainlink's last reading?
+        # Positive = Binance is above Chainlink → next CL update likely UP
+        if anchor > 0:
+            cl_deviation = (btc.price - anchor) / anchor  # e.g. +0.003 = Binance 0.3% above CL
+        else:
+            cl_deviation = 0.0
 
-        # Map momentum to probability adjustment
-        # Positive momentum → higher prob of continued up move
-        # Scale: 0.01% change → ~0.1 probability shift (aggressive)
-        adj_1m = min(max(mom_1m * 10, -0.15), 0.15)
-        adj_5m = min(max(mom_5m * 5, -0.10), 0.10)
+        adj_1m       = min(max(btc.change_1m * 10,   -0.15), 0.15)
+        adj_5m       = min(max(btc.change_5m * 5,    -0.10), 0.10)
+        adj_cl_dev   = min(max(cl_deviation  * 15,   -0.12), 0.12)  # strongest signal
+        momentum_adj = (adj_cl_dev * 0.5 + adj_1m * 0.35 + adj_5m * 0.15)
 
-        # Volume confirmation (high volume = stronger signal)
-        vol_factor = 1.0  # TODO: normalize by avg volume
+        cvd_adj = cvd_signal * 0.08
+        liq_adj = liq_signal * 0.06
 
-        fair_value = base + (adj_1m * 0.7 + adj_5m * 0.3) * vol_factor
+        fair_value = 0.50 + momentum_adj + cvd_adj + liq_adj
         return min(max(fair_value, 0.02), 0.98)
 
     def generate_signal(
         self,
         contract: MarketContract,
-        btc: BTCPrice
+        btc: BTCPrice,
+        cvd_signal: float = 0.0,
+        liq_signal: float = 0.0,
+        chainlink_price: float = 0.0,
     ) -> tuple[Signal, float, float]:
         """
         Returns: (signal, edge, confidence)
@@ -593,7 +826,7 @@ class SignalEngine:
         if contract.seconds_to_expiry < 30:
             return Signal.HOLD, 0.0, 0.0
 
-        fair_value = self.calculate_fair_value(btc)
+        fair_value = self.calculate_fair_value(btc, cvd_signal, liq_signal, chainlink_price)
 
         yes_edge = fair_value - contract.yes_price
         no_edge = (1 - fair_value) - contract.no_price
@@ -1120,10 +1353,12 @@ class PolymarketBot:
         self.mode = mode
 
         # Initialize components
-        self.btc_feed = BTCPriceFeed(cfg)
-        self.poly_feed = PolymarketFeed(cfg)
+        self.btc_feed      = BTCPriceFeed(cfg)
+        self.chainlink     = ChainlinkFeed()
+        self.poly_feed     = PolymarketFeed(cfg)
         self.signal_engine = SignalEngine(cfg)
-        self.risk = RiskManager(cfg, cfg.initial_capital)
+        self.enhanced_feed = EnhancedSignalFeed()
+        self.risk          = RiskManager(cfg, cfg.initial_capital)
         self.position_monitor = PositionMonitor(cfg)
         self.claude_bot = ClaudeBot(cfg)
 
@@ -1157,7 +1392,9 @@ class PolymarketBot:
         # Start data feeds concurrently
         await asyncio.gather(
             self.btc_feed.connect(),
+            self.chainlink.start(),
             self.poly_feed.start(),
+            self.enhanced_feed.start(),
             self._main_loop(),
             self._status_reporter(),
             self._state_writer(),
@@ -1232,6 +1469,9 @@ class PolymarketBot:
                     "btc_price": btc.price if btc else 0.0,
                     "btc_change_1m": btc.change_1m if btc else 0.0,
                     "btc_change_5m": btc.change_5m if btc else 0.0,
+                    "chainlink_price": self.chainlink.price,
+                    "cvd_signal": round(self.enhanced_feed.cvd_signal, 2),
+                    "liq_signal": round(self.enhanced_feed.liq_signal, 2),
                     "wins": self.risk.wins_today,
                     "losses": self.risk.losses_today,
                     "open_trades": open_list,
@@ -1257,7 +1497,9 @@ class PolymarketBot:
     async def _command_reader(self):
         """Read commands written by the dashboard (pause/stop/set_claude)."""
         cmd_file = f"{self.cfg.data_dir}/bot_commands.json"
-        last_ts: float = 0.0
+        # Ignore any commands that existed before this bot session started.
+        # This prevents stale stop/pause commands from a previous run killing the bot on startup.
+        last_ts: float = self._start_time
         while self._running:
             try:
                 if os.path.exists(cmd_file):
@@ -1301,8 +1543,7 @@ class PolymarketBot:
         if not markets:
             total = len(self.poly_feed.markets)
             if self._scan_count % 50 == 0:  # Log every ~5s
-                logger.info(f"⏳ Waiting for tradeable markets (tracked: {total}, need 30–600s to expiry)")
-            self._scan_count += 1
+                logger.debug(f"No tradeable markets (total tracked: {total}, need 30–300s to expiry)")
             return
 
         # Get AI market regime (async, cached)
@@ -1319,7 +1560,12 @@ class PolymarketBot:
                    for t in self._open_trades.values()):
                 continue
 
-            signal, edge, confidence = self.signal_engine.generate_signal(contract, btc)
+            signal, edge, confidence = self.signal_engine.generate_signal(
+                contract, btc,
+                cvd_signal=self.enhanced_feed.cvd_signal,
+                liq_signal=self.enhanced_feed.liq_signal,
+                chainlink_price=self.chainlink.price,
+            )
 
             if signal == Signal.HOLD:
                 logger.debug(
