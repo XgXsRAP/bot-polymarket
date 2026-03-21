@@ -1,8 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║     POLYMARKET BTC 5-MIN HIGH-FREQUENCY TRADING BOT      ║
-║     Strategy: Micro-edge scalping on prediction markets  ║
-║     Target: 0.10-0.80% profit per trade                  ║
+║     POLYMARKET BTC HIGH-FREQUENCY TRADING BOT            ║
+║     Strategy: Edge scalping on 5m/15m prediction markets ║
+║     Target: 2.5% profit / 1.0% stop → 2.5:1 R/R         ║
+║     Break-even WR: ~30% | Capital: $100 | Position: $5   ║
 ║     Mode: Paper Trading (set PAPER_TRADING=false to live)║
 ╚══════════════════════════════════════════════════════════╝
 """
@@ -12,6 +13,7 @@ import json
 import time
 import os
 import sys
+import re
 import argparse
 import signal
 from collections import deque
@@ -22,19 +24,22 @@ from enum import Enum
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ── polybot2 signal data (CVD + liquidations) ──
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "polybot2"))
-try:
-    from hyperliquid_api import HyperliquidAPI as _HLApi
-    HL_AVAILABLE = True
-except ImportError:
-    HL_AVAILABLE = False
-
-try:
-    from liquidation_feed import LiquidationFeed
-    LIQ_FEED_AVAILABLE = True
-except ImportError:
-    LIQ_FEED_AVAILABLE = False
+# ── Hyperliquid API (CVD + liquidations + oracle price) ──
+# Try local hyperliquid_api.py first, then fall back to polybot2 sibling dir.
+HL_AVAILABLE = False
+_hl_search = [
+    os.path.dirname(os.path.abspath(__file__)),                          # local (same folder)
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "polybot2"),  # polybot2
+]
+for _d in _hl_search:
+    try:
+        if _d not in sys.path:
+            sys.path.insert(0, _d)
+        from hyperliquid_api import HyperliquidAPI as _HLApi
+        HL_AVAILABLE = True
+        break
+    except ImportError:
+        pass
 
 # ── Try to import uvloop for faster event loop (Linux only) ──
 try:
@@ -80,6 +85,20 @@ except ImportError:
 
 load_dotenv()
 
+# ── BTC market discovery regex (flexible matching) ──
+_BTC_SLUG_RE = re.compile(
+    r"btc[-_]?(up[-_]?down|updown|higher|lower|prediction)", re.IGNORECASE
+)
+_BTC_TITLE_RE = re.compile(
+    r"(?:btc|bitcoin).*?"
+    r"(?:up\s*(?:or|/|,)\s*down|"       # "up or down", "up/down", "up, down"
+    r"higher\s*or\s*lower|"              # "higher or lower"
+    r"above\s*or\s*below|"              # "above or below"
+    r"updown|"                           # "updown"
+    r"(?:\d+)\s*[-\s]?(?:min|minute|m)\b)",  # "5 min", "15-minute", "5m"
+    re.IGNORECASE
+)
+
 # ═══════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════
@@ -101,15 +120,17 @@ class Config:
     initial_capital: float = field(default_factory=lambda: float(os.getenv("INITIAL_CAPITAL", "1000")))
 
     # ── Risk Management ──
-    max_trade_pct: float = 0.05         # 5% of capital per trade  ($5 at $100)
-    max_positions: int   = 5            # max concurrent open positions
-    daily_loss_limit_pct: float = 0.02  # 2% daily loss limit
+    max_trade_pct: float = 0.05          # 5% of capital per trade ($5 on $100)
+    daily_loss_limit_pct: float = 0.10  # 10% daily loss limit ($10 on $100)
     min_edge_required: float = 0.005    # 0.5% minimum edge to enter
-    min_profit_target: float = 0.003    # 0.30% profit target
-    stop_loss_pct: float = -0.003       # −0.30% stop loss
+    min_profit_target: float = 0.025    # 2.5% profit target ($0.125 on $5)
+    stop_loss_pct: float = 0.01         # 1.0% stop loss ($0.05 on $5) — R/R = 2.5:1
     max_hold_seconds: int = 270         # 4.5 minutes max hold
     consecutive_loss_limit: int = 5     # Circuit breaker: 5 losses → pause
     circuit_breaker_pause: int = 600    # Pause 10 minutes after circuit break
+    wr_circuit_breaker_min: float = 0.30  # Pause if rolling win rate < 30%
+    wr_circuit_breaker_window: int = 20   # Rolling window of last 20 trades
+    wr_circuit_breaker_pause: int = 900   # Pause 15 minutes after WR breaker
 
     # ── Speed & Latency ──
     target_latency_ms: int = 100        # Target 100ms execution
@@ -123,6 +144,13 @@ class Config:
     # Kraken format: {"a":["price",...], "b":["price",...], ...} on the ticker channel
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
     kraken_ws_url: str = "wss://ws.kraken.com"
+    hyperliquid_info_url: str = "https://api.hyperliquid.xyz/info"
+
+    # ── Market Window Filter ──
+    # 0 = trade all windows (5m + 15m), 300 = 5-min only, 900 = 15-min only
+    market_window_seconds: int = field(
+        default_factory=lambda: int(os.getenv("MARKET_WINDOW_SECONDS", "0"))
+    )
 
     # ── Files ──
     log_dir: str = "logs"
@@ -159,6 +187,7 @@ class MarketContract:
     yes_price: float      # Current YES share price (0–1)
     no_price: float       # Current NO share price (0–1)
     expiry_ts: float      # Unix timestamp of market expiry
+    start_ts: float = 0.0    # Market open timestamp (used to compute window)
     last_updated: float = field(default_factory=time.time)
     yes_token_id: str = ""   # CLOB token ID for YES side
     no_token_id: str  = ""   # CLOB token ID for NO side
@@ -166,6 +195,13 @@ class MarketContract:
     @property
     def seconds_to_expiry(self) -> float:
         return self.expiry_ts - time.time()
+
+    @property
+    def window_seconds(self) -> float:
+        """Nominal duration of this market (e.g. 300 for 5-min, 900 for 15-min)."""
+        if self.start_ts > 0:
+            return self.expiry_ts - self.start_ts
+        return 0.0
 
     @property
     def implied_prob_yes(self) -> float:
@@ -268,6 +304,73 @@ class ChainlinkFeed:
                 except Exception as e:
                     logger.debug(f"Chainlink feed error: {e}")
                 await asyncio.sleep(5)
+
+    def stop(self):
+        self._running = False
+
+
+# ═══════════════════════════════════════════════════════════
+#  HYPERLIQUID PRICE + SIGNAL FEED
+# ═══════════════════════════════════════════════════════════
+
+class HyperliquidPriceFeed:
+    """
+    Polls Hyperliquid oracle price, funding rate, and open interest every second.
+
+    Oracle price = weighted median of Binance/Bybit/OKX spot prices.
+    Used as the 3rd independent BTC price source (Binance → Kraken → Hyperliquid).
+    Also provides funding rate and OI for signal enhancement.
+    """
+
+    _URL = "https://api.hyperliquid.xyz/info"
+
+    def __init__(self):
+        self.price: float = 0.0           # Oracle price (spot equivalent)
+        self.mark_price: float = 0.0      # Perp mark price
+        self.funding: float = 0.0         # Hourly funding rate (+ve = longs pay shorts)
+        self.open_interest: float = 0.0   # OI in USD
+        self.last_updated: float = 0.0
+        self._running = False
+
+    async def start(self):
+        self._running = True
+        logger.info("📡 HyperliquidFeed starting (oracle + funding + OI)...")
+        async with aiohttp.ClientSession() as session:
+            while self._running:
+                try:
+                    async with session.post(
+                        self._URL,
+                        json={"type": "metaAndAssetCtxs"},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as r:
+                        data = await r.json()
+                        if isinstance(data, list) and len(data) == 2:
+                            universe = data[0].get("universe", [])
+                            ctx_list = data[1]
+                            for i, asset in enumerate(universe):
+                                if asset.get("name") == "BTC" and i < len(ctx_list):
+                                    ctx     = ctx_list[i]
+                                    oracle  = float(ctx.get("oraclePx",     0) or 0)
+                                    mark    = float(ctx.get("markPx",       0) or 0)
+                                    fund    = float(ctx.get("funding",      0) or 0)
+                                    oi_c    = float(ctx.get("openInterest", 0) or 0)
+                                    if oracle > 0:
+                                        first = self.price == 0
+                                        self.price         = oracle
+                                        self.mark_price    = mark
+                                        self.funding       = fund
+                                        self.open_interest = oi_c * oracle
+                                        self.last_updated  = time.time()
+                                        if first:
+                                            logger.success(
+                                                f"✅ Hyperliquid oracle: ${oracle:,.2f} | "
+                                                f"funding: {fund*100:.4f}%/hr | "
+                                                f"OI: ${oi_c*oracle/1e9:.2f}B"
+                                            )
+                                    break
+                except Exception as e:
+                    logger.debug(f"HyperliquidFeed error: {e}")
+                await asyncio.sleep(1)
 
     def stop(self):
         self._running = False
@@ -509,14 +612,27 @@ class PolymarketFeed:
 
     async def _process_events(self, events):
         """Extract BTC up/down markets from events (5m and 15m windows)."""
-        new_count = 0
-        now       = time.time()
+        new_count       = 0
+        now             = time.time()
+        searched        = 0
+        matched         = 0
+        rejected_closed = 0
+        rejected_expired = 0
+        rejected_long   = 0
 
         for event in events:
-            slug = event.get("slug", "") or event.get("ticker", "")
-            if "btc-updown" not in slug:
+            searched += 1
+            slug  = (event.get("slug", "") or event.get("ticker", "")).lower()
+            title = (event.get("title", "") or event.get("question", "")).lower()
+
+            # Accept if slug OR title/question matches BTC up/down pattern (flexible regex)
+            slug_match  = bool(_BTC_SLUG_RE.search(slug))
+            title_match = bool(_BTC_TITLE_RE.search(title))
+            if not (slug_match or title_match):
                 continue
+            matched += 1
             if event.get("closed") or not event.get("active"):
+                rejected_closed += 1
                 continue
 
             for m in event.get("markets", []):
@@ -532,6 +648,22 @@ class PolymarketFeed:
                 except Exception:
                     expiry_ts = now + 300
                 if expiry_ts <= now:
+                    rejected_expired += 1
+                    continue
+
+                # Parse start timestamp (used to detect 5-min vs 15-min window)
+                try:
+                    start_ts = datetime.fromisoformat(
+                        m.get("startDate", "").replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    start_ts = expiry_ts - 300  # Assume 5-min if unknown
+
+                # Reject long-duration markets (>30 min) — not suitable for HFT
+                duration = expiry_ts - start_ts
+                if duration > 1800:
+                    rejected_long += 1
+                    logger.debug(f"  Skipping long market ({int(duration)}s): {m.get('question','?')[:60]}")
                     continue
 
                 # YES/NO prices
@@ -556,16 +688,24 @@ class PolymarketFeed:
                     yes_price=yes_price,
                     no_price=no_price,
                     expiry_ts=expiry_ts,
+                    start_ts=start_ts,
                     yes_token_id=yes_token,
                     no_token_id=no_token,
                 )
 
                 if cid not in self.markets:
                     new_count += 1
+                    win = int(expiry_ts - start_ts)
+                    logger.debug(f"  New market: {m.get('question','?')[:60]} | window={win}s")
                 self.markets[cid] = contract
 
-        if new_count > 0:
-            logger.info(f"🎯 Found {len(self.markets)} BTC markets ({new_count} new)")
+        # Diagnostic logging — always log scan stats so user can see what happened
+        logger.info(
+            f"📡 Market scan: {searched} events | {matched} BTC matches | "
+            f"{rejected_closed} closed | {rejected_expired} expired | "
+            f"{rejected_long} too long | "
+            f"{len(self.markets)} tracked ({new_count} new)"
+        )
 
     async def _ws_prices(self):
         """Subscribe to real-time price updates via Polymarket WebSocket."""
@@ -643,11 +783,24 @@ class PolymarketFeed:
             pass
 
     def get_active_markets(self) -> list[MarketContract]:
-        """Return markets that haven't expired and are still tradeable."""
-        return [
-            m for m in self.markets.values()
-            if 30 < m.seconds_to_expiry < 1200   # up to 20 min (covers 5m and 15m windows)
-        ]
+        """
+        Return markets that haven't expired and are still tradeable.
+        If cfg.market_window_seconds > 0, only returns markets matching that window:
+          300 → 5-min markets only
+          900 → 15-min markets only
+          0   → all windows (default)
+        """
+        result = []
+        for m in self.markets.values():
+            if not (30 < m.seconds_to_expiry < 1200):
+                continue
+            # Window filter (optional)
+            win_filter = self.cfg.market_window_seconds
+            if win_filter > 0 and m.window_seconds > 0:
+                if abs(m.window_seconds - win_filter) > 120:   # ±2 min tolerance
+                    continue
+            result.append(m)
+        return result
 
     async def stop(self):
         self._running = False
@@ -665,18 +818,19 @@ class EnhancedSignalFeed:
     Produces two floats updated every ~60s:
       cvd_signal  : -1.0 (bearish div) … +1.0 (bullish div)
       liq_signal  : -1.0 (long liqs dominate) … +1.0 (short liqs dominate)
-    Also exposes liq_meta dict with raw liquidation data for ClaudeBot prompts.
     """
 
     def __init__(self):
-        self.cvd_signal: float = 0.0
-        self.liq_signal: float = 0.0
-        self.liq_meta:   dict  = {}
+        self.cvd_signal: float     = 0.0
+        self.liq_signal: float     = 0.0
+        self.funding_signal: float = 0.0   # -1 (overbought) … +1 (oversold)
+        self.oi_signal: float      = 0.0   # -1 (OI collapsing) … +1 (OI growing)
+        self._prev_oi: float       = 0.0   # For OI delta calculation
         self._running = False
         self._api = _HLApi() if HL_AVAILABLE else None
-        self._liq_feed = LiquidationFeed() if LIQ_FEED_AVAILABLE else None
         if not HL_AVAILABLE:
-            logger.warning("⚠️  polybot2/hyperliquid_api not found — running without CVD/liq signals")
+            logger.warning("⚠️  hyperliquid_api not found — running without CVD/liq/funding signals")
+            logger.warning("    Create hyperliquid_api.py in the same folder as bot.py")
 
     async def start(self):
         if not self._api:
@@ -694,6 +848,7 @@ class EnhancedSignalFeed:
     def _refresh(self):
         self._update_cvd()
         self._update_liquidations()
+        self._update_funding_oi()
 
     def _update_cvd(self):
         """
@@ -735,45 +890,69 @@ class EnhancedSignalFeed:
 
     def _update_liquidations(self):
         """
-        Delegate to LiquidationFeed for a richer signal combining:
-          - Exchange liquidations (Binance + OKX, last 15 min)
-          - Whale near-liquidation positions (within 1% of liq price)
-        Falls back to simple long/short liq ratio if LiquidationFeed unavailable.
+        Compare long vs short liquidations from Binance + OKX last batch.
+        More short liqs (forced short covering) → bullish  → +1.0
+        More long liqs  (forced long selling)   → bearish  → -1.0
         """
-        if self._liq_feed:
-            try:
-                self._liq_feed.refresh()
-                self.liq_signal = self._liq_feed.get_signal()
-                self.liq_meta   = self._liq_feed.get_meta()
-                m = self.liq_meta
-                logger.debug(
-                    f"liq_signal={self.liq_signal:+.3f} "
-                    f"long=${m.get('long_liq_usd', 0)/1e6:.2f}M "
-                    f"short=${m.get('short_liq_usd', 0)/1e6:.2f}M "
-                    f"near_liq={m.get('near_liq_count', 0)} pos"
-                )
-            except Exception as e:
-                logger.debug(f"LiquidationFeed error: {e}")
-            return
-
-        # Fallback: simple liq ratio (no near-liq data)
-        if not self._api:
-            return
         try:
             liqs = self._api.get_all_liquidations("1h")
             if not liqs:
                 self.liq_signal = 0.0
                 return
+
             long_usd  = sum(l["value"] for l in liqs if l.get("side") == "long")
             short_usd = sum(l["value"] for l in liqs if l.get("side") == "short")
             total     = long_usd + short_usd
+
             if total == 0:
                 self.liq_signal = 0.0
                 return
+
+            # More long liqs → bearish pressure; more short liqs → bullish pressure
             self.liq_signal = (short_usd - long_usd) / total
             logger.debug(f"Liq signal={self.liq_signal:+.2f} long=${long_usd/1e6:.2f}M short=${short_usd/1e6:.2f}M")
         except Exception as e:
             logger.debug(f"Liq update error: {e}")
+
+    def _update_funding_oi(self):
+        """
+        Funding rate signal:
+          High positive funding (>0.02%/hr) → longs are crowded → bearish pressure → -0.5
+          High negative funding (<-0.02%/hr) → shorts are crowded → bullish squeeze → +0.5
+          Near zero → neutral (0.0)
+
+        OI delta signal:
+          OI growing fast (+2%) → new money entering, trend is real → reinforce momentum
+          OI shrinking fast (-2%) → positions closing, trend losing steam → fade signal
+        """
+        try:
+            fi = self._api.get_funding_and_oi("BTC")
+            funding = fi.get("funding", 0.0)
+            oi      = fi.get("open_interest", 0.0)
+
+            # Funding signal — thresholds in %/hr
+            # Typical HL funding: -0.01% to +0.01% per hour
+            if   funding >  0.0002:  self.funding_signal = -0.5   # Very overbought
+            elif funding >  0.00005: self.funding_signal = -0.2   # Mildly overbought
+            elif funding < -0.0002:  self.funding_signal =  0.5   # Very oversold
+            elif funding < -0.00005: self.funding_signal =  0.2   # Mildly oversold
+            else:                    self.funding_signal =  0.0
+
+            # OI delta signal (compare to previous reading)
+            if self._prev_oi > 0 and oi > 0:
+                oi_delta = (oi - self._prev_oi) / self._prev_oi
+                if   oi_delta >  0.02:  self.oi_signal =  0.3   # OI growing → trend real
+                elif oi_delta < -0.02:  self.oi_signal = -0.3   # OI shrinking → fade
+                else:                   self.oi_signal =  0.0
+            if oi > 0:
+                self._prev_oi = oi
+
+            logger.debug(
+                f"Funding signal={self.funding_signal:+.1f} ({funding*100:.4f}%/hr) | "
+                f"OI signal={self.oi_signal:+.1f} OI=${oi/1e9:.2f}B"
+            )
+        except Exception as e:
+            logger.debug(f"Funding/OI update error: {e}")
 
     def stop(self):
         self._running = False
@@ -802,6 +981,8 @@ class SignalEngine:
         btc: BTCPrice,
         cvd_signal: float = 0.0,
         liq_signal: float = 0.0,
+        funding_signal: float = 0.0,
+        oi_signal: float = 0.0,
         chainlink_price: float = 0.0,
     ) -> float:
         """
@@ -810,10 +991,12 @@ class SignalEngine:
         Uses Chainlink as the anchor (settlement price) and Binance momentum
         to predict which direction Chainlink will move next.
 
-        Components:
-          momentum  — Binance 1m/5m change vs Chainlink anchor  (0.50)
-          cvd       — CVD divergence from polybot2               (0.30)
-          liq       — liquidation pressure                       (0.20)
+        Signal weights (must sum to ~1.0 across all adjustments):
+          momentum  — Chainlink deviation + 1m/5m Binance change  (dominant)
+          cvd       — cumulative volume delta divergence           (8%)
+          liq       — liquidation pressure (long vs short liqs)   (6%)
+          funding   — funding rate crowding signal                 (5%)
+          oi        — open interest delta (trend conviction)       (4%)
         """
         # ── Use Chainlink as anchor if available, else fall back to Binance ──
         anchor = chainlink_price if chainlink_price > 0 else btc.price
@@ -830,10 +1013,12 @@ class SignalEngine:
         adj_cl_dev   = min(max(cl_deviation  * 15,   -0.12), 0.12)  # strongest signal
         momentum_adj = (adj_cl_dev * 0.5 + adj_1m * 0.35 + adj_5m * 0.15)
 
-        cvd_adj = cvd_signal * 0.08
-        liq_adj = liq_signal * 0.06
+        cvd_adj     = cvd_signal     * 0.08
+        liq_adj     = liq_signal     * 0.06
+        funding_adj = funding_signal * 0.05   # High positive funding → bearish pressure
+        oi_adj      = oi_signal      * 0.04   # Growing OI → trend has conviction
 
-        fair_value = 0.50 + momentum_adj + cvd_adj + liq_adj
+        fair_value = 0.50 + momentum_adj + cvd_adj + liq_adj + funding_adj + oi_adj
         return min(max(fair_value, 0.02), 0.98)
 
     def generate_signal(
@@ -842,6 +1027,8 @@ class SignalEngine:
         btc: BTCPrice,
         cvd_signal: float = 0.0,
         liq_signal: float = 0.0,
+        funding_signal: float = 0.0,
+        oi_signal: float = 0.0,
         chainlink_price: float = 0.0,
     ) -> tuple[Signal, float, float]:
         """
@@ -853,7 +1040,9 @@ class SignalEngine:
         if contract.seconds_to_expiry < 30:
             return Signal.HOLD, 0.0, 0.0
 
-        fair_value = self.calculate_fair_value(btc, cvd_signal, liq_signal, chainlink_price)
+        fair_value = self.calculate_fair_value(
+            btc, cvd_signal, liq_signal, funding_signal, oi_signal, chainlink_price
+        )
 
         yes_edge = fair_value - contract.yes_price
         no_edge = (1 - fair_value) - contract.no_price
@@ -894,6 +1083,9 @@ class RiskManager:
         self.trades_today = 0
         self.wins_today = 0
         self.losses_today = 0
+        # Rolling win-rate circuit breaker
+        self._recent_results: list[bool] = []  # last N trade results (True=win)
+        self._wr_pause_until: float = 0.0
 
     @property
     def daily_pnl_pct(self) -> float:
@@ -903,11 +1095,23 @@ class RiskManager:
     def is_circuit_breaker_active(self) -> bool:
         return time.time() < self.circuit_breaker_until
 
+    @property
+    def rolling_win_rate(self) -> float:
+        """Win rate over the last N trades (rolling window)."""
+        if not self._recent_results:
+            return 0.0
+        return sum(self._recent_results) / len(self._recent_results)
+
     def can_trade(self) -> tuple[bool, str]:
         """Returns (can_trade, reason)"""
         if self.is_circuit_breaker_active:
             remaining = int(self.circuit_breaker_until - time.time())
             return False, f"Circuit breaker active ({remaining}s remaining)"
+
+        # Win-rate circuit breaker: pause if rolling WR < 30% over last 20 trades
+        if time.time() < self._wr_pause_until:
+            remaining = int(self._wr_pause_until - time.time())
+            return False, f"Win rate breaker active ({remaining}s remaining, WR was <{self.cfg.wr_circuit_breaker_min*100:.0f}%)"
 
         if self.daily_pnl_pct <= -self.cfg.daily_loss_limit_pct:
             return False, f"Daily loss limit hit ({self.daily_pnl_pct*100:.2f}%)"
@@ -928,6 +1132,12 @@ class RiskManager:
     def record_trade_result(self, pnl: float):
         self.capital += pnl
         self.trades_today += 1
+
+        # Track rolling win rate
+        self._recent_results.append(pnl > 0)
+        if len(self._recent_results) > self.cfg.wr_circuit_breaker_window:
+            self._recent_results.pop(0)
+
         if pnl > 0:
             self.wins_today += 1
             self.consecutive_losses = 0
@@ -938,6 +1148,18 @@ class RiskManager:
                 self.circuit_breaker_until = time.time() + self.cfg.circuit_breaker_pause
                 logger.warning(f"⚡ CIRCUIT BREAKER: {self.cfg.consecutive_loss_limit} consecutive losses — pausing {self.cfg.circuit_breaker_pause}s")
 
+        # Check rolling win rate after enough trades
+        if len(self._recent_results) >= self.cfg.wr_circuit_breaker_window:
+            if self.rolling_win_rate < self.cfg.wr_circuit_breaker_min:
+                self._wr_pause_until = time.time() + self.cfg.wr_circuit_breaker_pause
+                logger.warning(
+                    f"⚡ WIN RATE BREAKER: {self.rolling_win_rate*100:.0f}% < "
+                    f"{self.cfg.wr_circuit_breaker_min*100:.0f}% over last "
+                    f"{self.cfg.wr_circuit_breaker_window} trades — pausing "
+                    f"{self.cfg.wr_circuit_breaker_pause}s"
+                )
+                self._recent_results.clear()  # Reset after pause
+
     @property
     def win_rate(self) -> float:
         if self.trades_today == 0:
@@ -945,11 +1167,12 @@ class RiskManager:
         return self.wins_today / self.trades_today
 
     def report(self) -> str:
+        rolling = f" | Rolling WR({len(self._recent_results)}): {self.rolling_win_rate*100:.1f}%" if self._recent_results else ""
         return (
             f"Capital: ${self.capital:.2f} | "
             f"Daily P&L: {self.daily_pnl_pct*100:+.2f}% | "
             f"Trades: {self.trades_today} | "
-            f"Win Rate: {self.win_rate*100:.1f}% | "
+            f"Win Rate: {self.win_rate*100:.1f}%{rolling} | "
             f"Consecutive Losses: {self.consecutive_losses}"
         )
 
@@ -1244,16 +1467,10 @@ class ClaudeBot:
         elif cfg.claude_enabled:
             logger.warning("⚠️  Claude AI requested but anthropic package missing or key not set")
 
-    async def analyze_market_regime(
-        self,
-        btc: BTCPrice,
-        cvd_signal: float = 0.0,
-        liq_meta: dict = None,
-    ) -> dict:
+    async def analyze_market_regime(self, btc: BTCPrice) -> dict:
         """
         Ask Claude to classify the current market regime.
         Returns regime classification and confidence multiplier.
-        Accepts optional cvd_signal and liq_meta for richer context.
         """
         if not self.client:
             return {"regime": "unknown", "trade_multiplier": 1.0, "reasoning": "Claude not available"}
@@ -1261,15 +1478,6 @@ class ClaudeBot:
         # Use cache to avoid too many API calls
         if time.time() - self._last_analysis_time < self._cache_seconds:
             return {"regime": self._last_analysis, "trade_multiplier": 1.0, "reasoning": "cached"}
-
-        if liq_meta is None:
-            liq_meta = {}
-
-        long_liq_usd   = liq_meta.get("long_liq_usd",   0)
-        short_liq_usd  = liq_meta.get("short_liq_usd",  0)
-        liq_signal     = liq_meta.get("liq_signal",     0.0)
-        near_liq_count = liq_meta.get("near_liq_count", 0)
-        near_liq_usd   = liq_meta.get("near_liq_usd",   0)
 
         try:
             prompt = f"""You are a crypto market microstructure analyst for a high-frequency trading bot.
@@ -1280,12 +1488,6 @@ Current BTC market data:
 - 5-minute change: {btc.change_5m*100:+.4f}%
 - Volume (24h): {btc.volume:,.0f}
 - Timestamp: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}
-
-Order flow & liquidation data (last 15 min):
-- Long liquidations: ${long_liq_usd:,.0f}  Short liquidations: ${short_liq_usd:,.0f}
-- Liquidation bias: {liq_signal:+.2f} (-1=bearish, +1=bullish)
-- Whales within 1% of liquidation: {near_liq_count} positions (${near_liq_usd:,.0f} at risk)
-- CVD signal: {cvd_signal:+.2f} (-1=bearish divergence, +1=bullish divergence)
 
 Task: Classify the current micro-trend for the next 5 minutes and provide a trading multiplier.
 
@@ -1302,8 +1504,7 @@ Rules:
 - trending_up/down: clear directional move, multiplier 1.2-1.5
 - sideways: no clear direction, multiplier 0.5-0.8
 - volatile: erratic moves, multiplier 0.6-0.9
-- trade_multiplier affects position sizing: >1.0 means increase size
-- Heavy liquidation imbalance or near-liq cascade risk should influence regime and bias"""
+- trade_multiplier affects position sizing: >1.0 means increase size"""
 
             response = await asyncio.get_running_loop().run_in_executor(
                 None,
@@ -1369,8 +1570,8 @@ class PositionMonitor:
         if unrealized_pnl_pct >= self.cfg.min_profit_target:
             return True, current_price, f"profit_target ({unrealized_pnl_pct*100:.2f}%)"
 
-        # 2. Stop loss: configurable via cfg.stop_loss_pct
-        if unrealized_pnl_pct <= self.cfg.stop_loss_pct:
+        # 2. Stop loss: configurable (default -1.0%, R/R = 2.5:1)
+        if unrealized_pnl_pct <= -self.cfg.stop_loss_pct:
             return True, current_price, f"stop_loss ({unrealized_pnl_pct*100:.2f}%)"
 
         # 3. Timeout: close 30 seconds before expiry
@@ -1404,6 +1605,7 @@ class PolymarketBot:
         # Initialize components
         self.btc_feed      = BTCPriceFeed(cfg)
         self.chainlink     = ChainlinkFeed()
+        self.hl_feed       = HyperliquidPriceFeed()
         self.poly_feed     = PolymarketFeed(cfg)
         self.signal_engine = SignalEngine(cfg)
         self.enhanced_feed = EnhancedSignalFeed()
@@ -1420,7 +1622,7 @@ class PolymarketBot:
             logger.info("📋 PAPER TRADING MODE — No real money used")
 
         self._running = False
-        self._paused = True   # start paused — user must press [R] in dashboard to begin auto-trading
+        self._paused = False
         self._open_trades: dict[str, TradeRecord] = {}
         self._scan_count = 0
         self._start_time = time.time()
@@ -1442,6 +1644,7 @@ class PolymarketBot:
         await asyncio.gather(
             self.btc_feed.connect(),
             self.chainlink.start(),
+            self.hl_feed.start(),
             self.poly_feed.start(),
             self.enhanced_feed.start(),
             self._main_loop(),
@@ -1455,7 +1658,6 @@ class PolymarketBot:
         # Wait for initial data
         logger.info("⏳ Waiting for market data feeds...")
         await asyncio.sleep(5)
-        logger.info("Bot is PAUSED on startup. Press [R] in dashboard (or send 'start' command) to begin auto-trading.")
 
         while self._running:
             loop_start = time.perf_counter()
@@ -1519,9 +1721,14 @@ class PolymarketBot:
                     "btc_price": btc.price if btc else 0.0,
                     "btc_change_1m": btc.change_1m if btc else 0.0,
                     "btc_change_5m": btc.change_5m if btc else 0.0,
-                    "chainlink_price": self.chainlink.price,
-                    "cvd_signal": round(self.enhanced_feed.cvd_signal, 2),
-                    "liq_signal": round(self.enhanced_feed.liq_signal, 2),
+                    "chainlink_price":  self.chainlink.price,
+                    "hl_price":         round(self.hl_feed.price, 2),
+                    "hl_funding":       round(self.hl_feed.funding * 100, 5),   # % per hour
+                    "hl_oi_b":          round(self.hl_feed.open_interest / 1e9, 3),  # billions USD
+                    "cvd_signal":       round(self.enhanced_feed.cvd_signal,     2),
+                    "liq_signal":       round(self.enhanced_feed.liq_signal,     2),
+                    "funding_signal":   round(self.enhanced_feed.funding_signal, 2),
+                    "oi_signal":        round(self.enhanced_feed.oi_signal,      2),
                     "wins": self.risk.wins_today,
                     "losses": self.risk.losses_today,
                     "open_trades": open_list,
@@ -1596,16 +1803,12 @@ class PolymarketBot:
                 logger.debug(f"No tradeable markets (total tracked: {total}, need 30–300s to expiry)")
             return
 
-        # Get AI market regime (async, cached) — pass liq + CVD context
-        self._ai_analysis = await self.claude_bot.analyze_market_regime(
-            btc,
-            cvd_signal=self.enhanced_feed.cvd_signal,
-            liq_meta=self.enhanced_feed.liq_meta,
-        )
+        # Get AI market regime (async, cached)
+        self._ai_analysis = await self.claude_bot.analyze_market_regime(btc)
         trade_multiplier = self._ai_analysis.get("trade_multiplier", 1.0)
 
-        # Limit concurrent open positions
-        if len(self._open_trades) >= self.cfg.max_positions:
+        # Limit concurrent open positions to 3
+        if len(self._open_trades) >= 3:
             return
 
         for contract in markets:
@@ -1618,6 +1821,8 @@ class PolymarketBot:
                 contract, btc,
                 cvd_signal=self.enhanced_feed.cvd_signal,
                 liq_signal=self.enhanced_feed.liq_signal,
+                funding_signal=self.enhanced_feed.funding_signal,
+                oi_signal=self.enhanced_feed.oi_signal,
                 chainlink_price=self.chainlink.price,
             )
 
