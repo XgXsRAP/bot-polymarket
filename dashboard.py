@@ -10,6 +10,7 @@ Keyboard controls:
 
 import json
 import os
+import re
 import select
 import sys
 import termios
@@ -21,6 +22,20 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+
+# ── BTC market discovery regex (same as bot.py — flexible matching) ──
+_BTC_SLUG_RE = re.compile(
+    r"btc[-_]?(up[-_]?down|updown|higher|lower|prediction)", re.IGNORECASE
+)
+_BTC_TITLE_RE = re.compile(
+    r"(?:btc|bitcoin).*?"
+    r"(?:up\s*(?:or|/|,)\s*down|"
+    r"higher\s*or\s*lower|"
+    r"above\s*or\s*below|"
+    r"updown|"
+    r"(?:\d+)\s*[-\s]?(?:min|minute|m)\b)",
+    re.IGNORECASE
+)
 from rich import box
 from rich.align import Align
 from rich.console import Console, Group
@@ -58,6 +73,7 @@ class MarketState:
         self.last_poly_fetch = 0.0
         self.last_btc_fetch  = 0.0
         self.error           = ""
+        self.search_stats    = ""   # e.g. "Scanned: 150 | Matched: 2 | Active: 1"
 
     def snapshot(self):
         with self.lock:
@@ -78,30 +94,86 @@ def _fetch_btc_price():
 
 
 def _fetch_active_market():
+    """Search for BTC short-duration markets using /events API + flexible regex."""
+    searched = 0
+    matched  = 0
+    now      = time.time()
+    candidates = []
+
+    # Try /events endpoint first (same as bot.py — returns grouped events with sub-markets)
     try:
         r = requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"active": "true", "limit": 200}, timeout=6,
+            "https://gamma-api.polymarket.com/events",
+            params={"active": "true", "closed": "false", "limit": 100},
+            timeout=6,
         )
-        markets = r.json()
-    except Exception:
-        return None
+        events = r.json()
+        for event in events:
+            searched += 1
+            slug  = (event.get("slug", "") or event.get("ticker", "")).lower()
+            title = (event.get("title", "") or event.get("question", "")).lower()
 
-    now = time.time()
-    candidates = []
-    for m in markets:
-        q = m.get("question", "").lower()
-        if not (("btc" in q or "bitcoin" in q) and ("up or down" in q)):
-            continue
+            slug_match  = bool(_BTC_SLUG_RE.search(slug))
+            title_match = bool(_BTC_TITLE_RE.search(title))
+            if not (slug_match or title_match):
+                continue
+            matched += 1
+            if event.get("closed") or not event.get("active"):
+                continue
+
+            for m in event.get("markets", []):
+                try:
+                    end_ts = datetime.fromisoformat(
+                        m.get("endDate", "").replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    continue
+                # Reject long-duration markets (>30 min)
+                try:
+                    start_ts = datetime.fromisoformat(
+                        m.get("startDate", "").replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    start_ts = end_ts - 300
+                duration = end_ts - start_ts
+                if duration > 1800:
+                    continue
+
+                secs_left = end_ts - now
+                if secs_left > 10:
+                    candidates.append((secs_left, m))
+    except Exception:
+        pass
+
+    # Fallback: try /markets endpoint (flat list, catches individual market listings)
+    if not candidates:
         try:
-            end_ts = datetime.fromisoformat(
-                m.get("endDate", "").replace("Z", "+00:00")
-            ).timestamp()
+            r = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"active": "true", "limit": 200}, timeout=6,
+            )
+            markets = r.json()
+            for m in markets:
+                searched += 1
+                q = m.get("question", "").lower()
+                if not _BTC_TITLE_RE.search(q):
+                    continue
+                matched += 1
+                try:
+                    end_ts = datetime.fromisoformat(
+                        m.get("endDate", "").replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    continue
+                secs_left = end_ts - now
+                if secs_left > 10:
+                    candidates.append((secs_left, m))
         except Exception:
-            continue
-        secs_left = end_ts - now
-        if secs_left > 10:
-            candidates.append((secs_left, m))
+            pass
+
+    # Update search stats for dashboard display
+    with _mkt.lock:
+        _mkt.search_stats = f"Scanned: {searched} | BTC matches: {matched} | Active: {len(candidates)}"
 
     if not candidates:
         return None
@@ -224,7 +296,7 @@ def _p(v: float) -> str:
 def build_screen(snap: dict, bot: dict) -> str:
     """Build a plain-text screen that works at any terminal width."""
     now   = time.time()
-    w     = console.width or 60
+    w     = max(console.width or 80, 80)   # minimum 80 columns
 
     secs  = max(0.0, snap["end_ts"] - now)
     mins  = int(secs) // 60
@@ -253,7 +325,7 @@ def build_screen(snap: dict, bot: dict) -> str:
 
     run_txt = "STOPPED" if not running else ("PAUSED" if paused else "RUNNING")
     run_col = "red"     if not running else ("yellow" if paused else "green")
-    dc      = "green" if diff >= 0 else "red"
+
     tc      = "red"   if secs < 30 else ("yellow" if secs < 60 else "green")
     pc      = "green" if pnl >= 0 else "red"
 
@@ -276,24 +348,52 @@ def build_screen(snap: dict, bot: dict) -> str:
 
     t.add_row("", Text(f"₿  {q}", style="bold yellow"))
     sep()
-    row("PRICE TO BEAT", _p(anchor) if anchor > 0 else "—",        "bold yellow")
-    cl_price = bot.get("chainlink_price", 0.0)
-    cvd_sig  = bot.get("cvd_signal", 0.0)
-    liq_sig  = bot.get("liq_signal", 0.0)
+    # ── Single live BTC price (Binance is primary; HL oracle is hot-standby) ──
+    cl_price    = bot.get("chainlink_price", 0.0)
+    hl_price    = bot.get("hl_price",        0.0)
+    hl_funding  = bot.get("hl_funding",      0.0)
+    hl_oi_b     = bot.get("hl_oi_b",         0.0)
+    cvd_sig     = bot.get("cvd_signal",      0.0)
+    liq_sig     = bot.get("liq_signal",      0.0)
+    funding_sig = bot.get("funding_signal",  0.0)
+    oi_sig      = bot.get("oi_signal",       0.0)
 
-    row("BTC (Binance)",  _p(btc)      if btc > 0      else "fetching…", "bold cyan")
-    row("BTC (Chainlink)",_p(cl_price) if cl_price > 0 else "fetching…", "bold magenta")
-    if btc > 0 and anchor > 0:
+    # Show the one price the strategy acts on (Binance tick, HL oracle if down)
+    live_price = btc if btc > 0 else hl_price
+    live_src   = "Binance" if btc > 0 else ("HL oracle" if hl_price > 0 else "—")
+    row("BTC LIVE", f"{_p(live_price)}  [{live_src}]" if live_price > 0 else "fetching…", "bold cyan")
+
+    # Settlement delta — how far live price is ahead/behind Chainlink (the resolver)
+    settle = cl_price if cl_price > 0 else hl_price
+    if live_price > 0 and settle > 0:
+        s_diff = live_price - settle
+        s_pct  = s_diff / settle * 100
+        sign   = "+" if s_diff >= 0 else ""
+        settle_src = "CL" if cl_price > 0 else "HL"
+        row(
+            f"vs settle ({settle_src})",
+            f"{sign}{s_pct:.3f}%  {'leads ▲' if s_diff >= 0 else 'lags ▼'}",
+            "green" if s_diff >= 0 else "red",
+        )
+
+    if anchor > 0 and live_price > 0:
         sign = "+" if diff >= 0 else ""
-        row("DIFF", f"{sign}{_p(diff)}  ({sign}{dpct:.3f}%)  {'▲ ABOVE' if diff>=0 else '▼ BELOW'}", dc)
-    if cl_price > 0 and btc > 0:
-        cl_diff = btc - cl_price
-        cl_pct  = cl_diff / cl_price * 100
-        row("BTC vs CL", f"{'+'if cl_diff>=0 else ''}{cl_pct:.3f}%  {'Binance ahead ▲' if cl_diff>=0 else 'Binance behind ▼'}", "green" if cl_diff >= 0 else "red")
-    cvd_txt = f"{cvd_sig:+.1f}  {'bullish div' if cvd_sig>0.5 else 'bearish div' if cvd_sig<-0.5 else 'neutral'}"
-    liq_txt = f"{liq_sig:+.2f}  {'short squeezes ▲' if liq_sig>0.2 else 'long liquidations ▼' if liq_sig<-0.2 else 'balanced'}"
-    row("CVD signal",  cvd_txt, "green" if cvd_sig > 0 else "red" if cvd_sig < 0 else "dim")
-    row("Liq signal",  liq_txt, "green" if liq_sig > 0 else "red" if liq_sig < 0 else "dim")
+        row("PRICE TO BEAT", f"{_p(anchor)}  ({sign}{dpct:.3f}%)", "bold yellow")
+
+    # Funding rate + OI — compact single line
+    if hl_price > 0:
+        fund_col = "red" if hl_funding > 0.02 else "green" if hl_funding < -0.02 else "dim"
+        row("Funding / OI", f"{hl_funding:+.4f}%/hr  |  OI ${hl_oi_b:.2f}B", fund_col)
+
+    sep()
+    cvd_txt    = f"{cvd_sig:+.1f}  {'bull div' if cvd_sig>0.5 else 'bear div' if cvd_sig<-0.5 else 'neutral'}"
+    liq_txt    = f"{liq_sig:+.2f}  {'short squeeze ▲' if liq_sig>0.2 else 'long liqs ▼' if liq_sig<-0.2 else 'balanced'}"
+    fund_s_txt = f"{funding_sig:+.1f}  {'overbought' if funding_sig<-0.3 else 'oversold' if funding_sig>0.3 else 'neutral'}"
+    oi_s_txt   = f"{oi_sig:+.1f}  {'growing' if oi_sig>0.1 else 'shrinking' if oi_sig<-0.1 else 'flat'}"
+    row("CVD",     cvd_txt,    "green" if cvd_sig    > 0 else "red" if cvd_sig    < 0 else "dim")
+    row("Liq",     liq_txt,    "green" if liq_sig    > 0 else "red" if liq_sig    < 0 else "dim")
+    row("Funding signal", fund_s_txt, "green" if funding_sig> 0 else "red" if funding_sig< 0 else "dim")
+    row("OI signal",      oi_s_txt,   "green" if oi_sig     > 0 else "red" if oi_sig     < 0 else "dim")
     sep()
     row("UP  bid/ask",   f"{up_bid:.4f} / {up_ask:.4f}  spread {up_ask-up_bid:.4f}", "green")
     row("DOWN bid/ask",  f"{dn_bid:.4f} / {dn_ask:.4f}  spread {dn_ask-dn_bid:.4f}", "red")
@@ -302,6 +402,8 @@ def build_screen(snap: dict, bot: dict) -> str:
     row("CAPITAL", f"{_p(capital)}  P&L {'+' if pnl>=0 else ''}{pnl:.2f}  W:{wins} L:{losses}  open:{open_n}", pc)
     if snap["error"]:
         row("⚠", snap["error"], "yellow")
+        if snap.get("search_stats"):
+            row("🔍", snap["search_stats"], "dim")
     sep()
     row(f"TIME {mins}:{secs2:02d}", Text(bar, style=tc), tc)
     sep()
