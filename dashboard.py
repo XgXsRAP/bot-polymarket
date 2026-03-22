@@ -1,474 +1,629 @@
+#!/usr/bin/env python3
 """
-POLYMARKET BTC UP/DOWN — COMPACT TERMINAL DASHBOARD
-Run: python3 dashboard.py
+POLYMARKET BTC UP/DOWN — HTML WEB DASHBOARD
+Run:  python3 dashboard.py
+Open: http://localhost:8888
 
-Keyboard controls:
-  [B] Buy UP      [S] Buy DOWN
-  [P] Pause bot   [R] Resume bot
-  [Q] Quit
+Keyboard (in browser):
+  B → Buy UP    S → Buy DOWN
+  P → Pause     R → Resume    Q → (n/a — just close tab)
 """
 
 import json
 import os
-import re
-import select
-import sys
-import termios
-import threading
 import time
-import tty
-from datetime import datetime
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import requests
-
-# ── BTC market discovery regex (same as bot.py — flexible matching) ──
-_BTC_SLUG_RE = re.compile(
-    r"btc[-_]?(up[-_]?down|updown|higher|lower|prediction)", re.IGNORECASE
-)
-_BTC_TITLE_RE = re.compile(
-    r"(?:btc|bitcoin).*?"
-    r"(?:up\s*(?:or|/|,)\s*down|"
-    r"higher\s*or\s*lower|"
-    r"above\s*or\s*below|"
-    r"updown|"
-    r"(?:\d+)\s*[-\s]?(?:min|minute|m)\b)",
-    re.IGNORECASE
-)
-from rich import box
-from rich.align import Align
-from rich.console import Console, Group
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
-
-# ── Paths ──
 STATE_FILE   = "data/bot_state.json"
 COMMAND_FILE = "data/bot_commands.json"
 Path("data").mkdir(exist_ok=True)
 
-console = Console()
+PORT = 8888
 
-_running    = True
-_status_msg = ""
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTML PAGE  (served once; JS polls /state every second)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-#  MARKET STATE
-# ─────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polymarket BTC Bot</title>
+<style>
+  :root {
+    --bg:      #0d1117;
+    --bg2:     #161b22;
+    --bg3:     #21262d;
+    --border:  #30363d;
+    --text:    #e6edf3;
+    --dim:     #7d8590;
+    --green:   #3fb950;
+    --red:     #f85149;
+    --yellow:  #d29922;
+    --cyan:    #79c0ff;
+    --orange:  #f0883e;
+    --purple:  #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 13px;
+    padding: 12px;
+  }
+  h2 {
+    color: var(--yellow);
+    font-size: 15px;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .card.wide { grid-column: 1 / -1; }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 3px 0;
+    border-bottom: 1px solid #1c2128;
+  }
+  .row:last-child { border-bottom: none; }
+  .label { color: var(--dim); width: 160px; flex-shrink: 0; }
+  .val   { text-align: right; font-weight: bold; }
+  .green  { color: var(--green);  }
+  .red    { color: var(--red);    }
+  .yellow { color: var(--yellow); }
+  .cyan   { color: var(--cyan);   }
+  .dim    { color: var(--dim);    }
+  .orange { color: var(--orange); }
+  .purple { color: var(--purple); }
 
-class MarketState:
-    def __init__(self):
-        self.lock            = threading.Lock()
-        self.question        = ""
-        self.condition_id    = ""
-        self.end_ts          = 0.0
-        self.up_bid          = 0.0
-        self.up_ask          = 0.0
-        self.down_bid        = 0.0
-        self.down_ask        = 0.0
-        self.price_to_beat   = 0.0
-        self.btc_price       = 0.0
-        self.last_poly_fetch = 0.0
-        self.last_btc_fetch  = 0.0
-        self.error           = ""
-        self.search_stats    = ""   # e.g. "Scanned: 150 | Matched: 2 | Active: 1"
+  /* Status badge */
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+  .badge-green  { background: #1a3a22; color: var(--green);  border: 1px solid var(--green); }
+  .badge-red    { background: #3a1a1a; color: var(--red);    border: 1px solid var(--red);   }
+  .badge-yellow { background: #3a2a0a; color: var(--yellow); border: 1px solid var(--yellow);}
 
-    def snapshot(self):
-        with self.lock:
-            return self.__dict__.copy()
+  /* Timer bar */
+  .timer-wrap { margin-top: 6px; }
+  .timer-bar-bg {
+    background: var(--bg3);
+    border-radius: 4px;
+    height: 10px;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+  .timer-bar { height: 100%; border-radius: 4px; transition: width 0.4s linear; }
 
-_mkt = MarketState()
+  /* Signal chips */
+  .signals { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  .chip {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    flex: 1 1 140px;
+    text-align: center;
+  }
+  .chip-label { color: var(--dim); font-size: 11px; text-transform: uppercase; }
+  .chip-val   { font-size: 16px; font-weight: bold; margin: 2px 0; }
+  .chip-note  { font-size: 11px; color: var(--dim); }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  th { color: var(--dim); font-size: 11px; text-align: left; padding: 4px 6px;
+       border-bottom: 1px solid var(--border); text-transform: uppercase; }
+  td { padding: 4px 6px; border-bottom: 1px solid #1c2128; font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--bg3); }
+
+  /* Buttons */
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  button {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 7px 18px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  button:hover { background: var(--border); }
+  button.buy-up   { border-color: var(--green);  color: var(--green);  }
+  button.buy-down { border-color: var(--red);    color: var(--red);    }
+  button.pause    { border-color: var(--yellow); color: var(--yellow); }
+  button.resume   { border-color: var(--cyan);   color: var(--cyan);   }
+
+  /* Header strip */
+  #header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  #header .title { color: var(--yellow); font-size: 16px; font-weight: bold; letter-spacing: 1px; }
+  #header .spacer { flex: 1; }
+  #last-updated { color: var(--dim); font-size: 11px; }
+  #status-msg {
+    position: fixed; bottom: 14px; right: 18px;
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 14px; font-size: 12px;
+    color: var(--cyan); display: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <span class="title">&#8383; POLYMARKET BTC BOT</span>
+  <span id="mode-badge" class="badge badge-yellow">PAPER</span>
+  <span id="run-badge"  class="badge badge-red">STOPPED</span>
+  <span class="spacer"></span>
+  <span id="uptime"  class="dim"></span>
+  <span id="last-updated" class="dim">—</span>
+</div>
+
+<div class="grid">
+
+  <!-- BTC / Prices -->
+  <div class="card">
+    <h2>&#9728; BTC Price</h2>
+    <div class="row"><span class="label" id="btc-src-lbl">Live (…)</span>   <span id="btc-live"   class="val cyan">—</span></div>
+    <div class="row"><span class="label">Chainlink (settle)</span><span id="cl-price"  class="val dim">—</span></div>
+    <div class="row"><span class="label">HL Oracle</span>         <span id="hl-price"  class="val dim">—</span></div>
+    <div class="row"><span class="label">vs Chainlink &#916;</span><span id="cl-delta" class="val">—</span></div>
+    <div class="row"><span class="label">1m change</span>         <span id="chg1m"     class="val">—</span></div>
+    <div class="row"><span class="label">5m change</span>         <span id="chg5m"     class="val">—</span></div>
+    <div class="row"><span class="label">Funding / OI</span>      <span id="funding"   class="val">—</span></div>
+    <div class="row"><span class="label">Latency</span>            <span id="latency"  class="val dim">—</span></div>
+  </div>
+
+  <!-- Bot / P&L -->
+  <div class="card">
+    <h2>&#128181; Bot / P&amp;L</h2>
+    <div class="row"><span class="label">Capital</span>       <span id="capital"   class="val cyan">—</span></div>
+    <div class="row"><span class="label">P&amp;L (today)</span><span id="pnl"     class="val">—</span></div>
+    <div class="row"><span class="label">Win / Loss</span>    <span id="wl"        class="val">—</span></div>
+    <div class="row"><span class="label">Win Rate</span>      <span id="wr"        class="val">—</span></div>
+    <div class="row"><span class="label">Open trades</span>   <span id="open-n"   class="val">—</span></div>
+    <div class="row"><span class="label">Consec losses</span> <span id="cons-loss" class="val">—</span></div>
+    <div class="row"><span class="label">Claude regime</span> <span id="claude"    class="val dim">—</span></div>
+    <div class="row"><span class="label">Markets tracked</span><span id="tracked" class="val">—</span></div>
+
+    <div class="btns">
+      <button class="buy-up"   onclick="cmd('buy','YES')" title="B">&#11014; Buy UP [B]</button>
+      <button class="buy-down" onclick="cmd('buy','NO')"  title="S">&#11015; Buy DOWN [S]</button>
+      <button class="pause"    onclick="cmd('pause')"     title="P">&#9646;&#9646; Pause [P]</button>
+      <button class="resume"   onclick="cmd('start')"     title="R">&#9654; Resume [R]</button>
+    </div>
+  </div>
+
+  <!-- Market / Timer -->
+  <div class="card wide">
+    <h2>&#128200; Active Market</h2>
+    <div id="question" style="color:var(--yellow);font-size:14px;margin-bottom:10px;">Waiting for market…</div>
+    <div class="row">
+      <span class="label">UP  bid / ask</span>
+      <span id="up-book" class="val green">—</span>
+    </div>
+    <div class="row">
+      <span class="label">DOWN  bid / ask</span>
+      <span id="dn-book" class="val red">—</span>
+    </div>
+    <div class="timer-wrap">
+      <div class="row">
+        <span class="label">Time remaining</span>
+        <span id="timer-txt" class="val">—</span>
+      </div>
+      <div class="timer-bar-bg">
+        <div id="timer-bar" class="timer-bar" style="width:100%;background:var(--green)"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Signals -->
+  <div class="card wide">
+    <h2>&#128301; Signals</h2>
+    <div class="signals">
+      <div class="chip" id="chip-cvd">
+        <div class="chip-label">CVD</div>
+        <div class="chip-val dim">—</div>
+        <div class="chip-note">neutral</div>
+      </div>
+      <div class="chip" id="chip-liq">
+        <div class="chip-label">Liquidations</div>
+        <div class="chip-val dim">—</div>
+        <div class="chip-note">balanced</div>
+      </div>
+      <div class="chip" id="chip-fund">
+        <div class="chip-label">Funding</div>
+        <div class="chip-val dim">—</div>
+        <div class="chip-note">neutral</div>
+      </div>
+      <div class="chip" id="chip-oi">
+        <div class="chip-label">Open Interest</div>
+        <div class="chip-val dim">—</div>
+        <div class="chip-note">flat</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Open Trades -->
+  <div class="card wide" id="trades-card">
+    <h2>&#128203; Open Trades</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Side</th><th>Entry</th><th>Current</th>
+          <th>PnL%</th><th>Shares</th><th>Held (s)</th><th>Market</th>
+        </tr>
+      </thead>
+      <tbody id="trades-body"><tr><td colspan="8" class="dim">No open trades</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Active Markets -->
+  <div class="card wide" id="markets-card">
+    <h2>&#128295; Tracked Markets</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Question</th><th>YES</th><th>NO</th><th>Expiry</th>
+          <th>Signal</th><th>Edge%</th><th>Conf</th><th>Pos?</th><th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="markets-body"><tr><td colspan="9" class="dim">No markets tracked</td></tr></tbody>
+    </table>
+  </div>
+
+</div><!-- /grid -->
+
+<div id="status-msg"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function fmt(v, dec=2) {
+  if (v === null || v === undefined) return '—';
+  return Number(v).toFixed(dec);
+}
+function fmtMoney(v) {
+  return '$' + Number(v).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function signColor(v, inv) {
+  if (v === null || v === undefined) return 'dim';
+  const pos = (v > 0) !== inv;  // inv=true means positive is bad
+  return pos ? 'green' : v < 0 ? 'red' : 'dim';
+}
+function setEl(id, html, cls) {
+  const el = $(id);
+  if (!el) return;
+  el.innerHTML = html;
+  if (cls !== undefined) el.className = 'val ' + cls;
+}
+function uptime(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = s%60;
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+}
+
+async function refresh() {
+  let d;
+  try {
+    const r = await fetch('/state');
+    if (!r.ok) return;
+    d = await r.json();
+  } catch(e) { return; }
+
+  // ── Header ──
+  const modeBadge = $('mode-badge');
+  modeBadge.textContent = (d.mode || 'paper').toUpperCase();
+  modeBadge.className   = 'badge ' + (d.mode==='live' ? 'badge-red' : 'badge-yellow');
+
+  const runBadge = $('run-badge');
+  const running  = d.running, paused = d.paused;
+  if (!running) { runBadge.textContent='STOPPED'; runBadge.className='badge badge-red'; }
+  else if (paused) { runBadge.textContent='PAUSED'; runBadge.className='badge badge-yellow'; }
+  else { runBadge.textContent='RUNNING'; runBadge.className='badge badge-green'; }
+
+  $('uptime').textContent = 'Up ' + uptime(d.uptime_seconds || 0);
+  $('last-updated').textContent = d.last_updated || '—';
+
+  // ── BTC ──
+  const btc = d.btc_price || 0;
+  const cl  = d.chainlink_price || 0;
+  const hl  = d.hl_price || 0;
+  setEl('btc-live', btc ? fmtMoney(btc) : 'fetching…', 'val cyan');
+  const srcMap = {binance:'Live (Binance)', kraken:'Live (Kraken)', rest:'Live (Kraken REST)'};
+  const srcEl = document.getElementById('btc-src-lbl');
+  if (srcEl) srcEl.textContent = srcMap[d.btc_source] || 'Live';
+
+  setEl('cl-price', cl ? fmtMoney(cl) : '—', 'val dim');
+  setEl('hl-price', hl ? fmtMoney(hl) : '—', 'val dim');
+
+  if (btc > 0 && cl > 0) {
+    const delta = (btc - cl) / cl * 100;
+    const sign  = delta >= 0 ? '+' : '';
+    const lbl   = delta >= 0 ? 'leads ▲' : 'lags ▼';
+    const col   = delta >= 0 ? 'green' : 'red';
+    setEl('cl-delta', `${sign}${delta.toFixed(3)}%  ${lbl}`, 'val ' + col);
+  }
+
+  const chg1 = d.btc_change_1m || 0;
+  const chg5 = d.btc_change_5m || 0;
+  setEl('chg1m', (chg1>=0?'+':'') + (chg1*100).toFixed(3)+'%', 'val ' + (chg1>=0?'green':'red'));
+  setEl('chg5m', (chg5>=0?'+':'') + (chg5*100).toFixed(3)+'%', 'val ' + (chg5>=0?'green':'red'));
+
+  const fund    = d.hl_funding || 0;
+  const oi_b    = d.hl_oi_b   || 0;
+  const fundCol = fund > 0.02 ? 'red' : fund < -0.02 ? 'green' : 'dim';
+  setEl('funding', `${fund>=0?'+':''}${fund.toFixed(4)}%/hr  |  OI $${oi_b.toFixed(2)}B`, 'val ' + fundCol);
+  setEl('latency', d.last_latency_ms != null ? d.last_latency_ms + ' ms' : '—', 'val dim');
+
+  // ── P&L ──
+  const cap    = d.capital      || 1000;
+  const start  = d.start_capital|| 1000;
+  const pnl    = cap - start;
+  const wins   = d.wins   || 0;
+  const losses = d.losses || 0;
+  const total  = wins + losses;
+  const wr     = total ? (wins / total * 100) : 0;
+
+  setEl('capital',   fmtMoney(cap), 'val cyan');
+  setEl('pnl',       (pnl>=0?'+':'') + fmtMoney(pnl), 'val ' + (pnl>=0?'green':'red'));
+  setEl('wl',        `W: ${wins}  L: ${losses}`, 'val');
+  setEl('wr',        total ? wr.toFixed(1)+'%' : '—', 'val ' + (wr>=55?'green':wr>=45?'yellow':'red'));
+  setEl('open-n',    (d.open_trades||[]).length, 'val');
+  setEl('cons-loss', d.consecutive_losses || 0, 'val ' + (d.consecutive_losses>=3?'red':'dim'));
+  const regime = d.claude_regime || 'unknown';
+  const mult   = d.claude_multiplier != null ? ` ×${d.claude_multiplier}` : '';
+  setEl('claude',    d.claude_enabled ? regime + mult : 'disabled', 'val dim');
+  const mActive = d.markets_tracked != null ? d.markets_tracked : '?';
+  const mTotal  = d.markets_total   != null ? d.markets_total   : '?';
+  setEl('tracked', `${mActive} active / ${mTotal} total`, 'val');
+
+  // ── Active market (first from list or fallback) ──
+  const mkt = (d.active_markets || [])[0];
+  if (mkt) {
+    $('question').textContent = mkt.question || 'Waiting…';
+    const secs = mkt.seconds_to_expiry || 0;
+    const pct  = Math.max(0, Math.min(1, secs / 300));
+    const mins = Math.floor(secs/60), ss = secs%60;
+    $('timer-txt').textContent = `${mins}:${String(ss).padStart(2,'0')}`;
+    $('timer-txt').className   = 'val ' + (secs<30?'red':secs<60?'yellow':'green');
+    const bar = $('timer-bar');
+    bar.style.width = (pct*100).toFixed(1) + '%';
+    bar.style.background = secs<30 ? 'var(--red)' : secs<60 ? 'var(--yellow)' : 'var(--green)';
+    setEl('up-book', `${fmt(mkt.yes_price,4)}  spread ${fmt(mkt.yes_price,4)}`, 'val green');
+    setEl('dn-book', `${fmt(mkt.no_price, 4)}  spread ${fmt(mkt.no_price, 4)}`, 'val red');
+  }
+
+  // ── Signals ──
+  function updateChip(chipId, val, posLbl, negLbl, neutLbl, inv) {
+    const chip = $(chipId);
+    if (!chip) return;
+    const vEl  = chip.querySelector('.chip-val');
+    const nEl  = chip.querySelector('.chip-note');
+    vEl.textContent = val != null ? (val >= 0 ? '+' : '') + fmt(val, 2) : '—';
+    const col = val == null ? 'dim' : ((val > 0) !== inv) ? 'green' : val < 0 ? 'red' : 'dim';
+    vEl.className = 'chip-val ' + col;
+    if (val != null) {
+      nEl.textContent = val > 0.1 ? posLbl : val < -0.1 ? negLbl : neutLbl;
+    }
+  }
+  updateChip('chip-cvd',  d.cvd_signal,     'bull div',       'bear div',  'neutral', false);
+  updateChip('chip-liq',  d.liq_signal,     'short squeeze ▲','long liqs ▼','balanced', false);
+  updateChip('chip-fund', d.funding_signal, 'oversold',       'overbought','neutral', false);
+  updateChip('chip-oi',   d.oi_signal,      'growing',        'shrinking', 'flat',    false);
+
+  // ── Open trades table ──
+  const tbody = $('trades-body');
+  const trades = d.open_trades || [];
+  if (trades.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="dim">No open trades</td></tr>';
+  } else {
+    const now = Date.now() / 1000;
+    tbody.innerHTML = trades.map(t => {
+      const pnlPct = t.entry_price > 0 ? ((t.current_price - t.entry_price) / t.entry_price * 100) : 0;
+      const pnlCol = pnlPct >= 0 ? 'green' : 'red';
+      const sideCol = t.side === 'YES' ? 'green' : 'red';
+      const held = t.entry_time ? Math.round(now - t.entry_time) : '—';
+      return `<tr>
+        <td class="dim">${(t.trade_id||'').slice(-6)}</td>
+        <td class="${sideCol}">${t.side}</td>
+        <td>${fmt(t.entry_price,4)}</td>
+        <td>${fmt(t.current_price,4)}</td>
+        <td class="${pnlCol}">${pnlPct>=0?'+':''}${pnlPct.toFixed(2)}%</td>
+        <td>${fmt(t.shares,1)}</td>
+        <td class="dim">${held}s</td>
+        <td class="dim" style="max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">${t.question||''}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // ── Markets table — show all tracked markets (active window + pending future ones) ──
+  const mbody = $('markets-body');
+  // Build a lookup of active-window markets by condition_id prefix for signal/edge/conf
+  const activeByKey = {};
+  (d.active_markets || []).forEach(m => { activeByKey[m.condition_id] = m; });
+
+  // Merge: tracked_markets_detail gives all found markets; enrich with signal data when available
+  const allMkts = d.tracked_markets_detail || d.active_markets || [];
+  if (allMkts.length === 0) {
+    mbody.innerHTML = '<tr><td colspan="9" class="dim">No markets found — waiting for scan…</td></tr>';
+  } else {
+    mbody.innerHTML = allMkts.map(m => {
+      const active = activeByKey[m.condition_id] || null;
+      const secs = m.seconds_to_expiry || 0;
+      // Expiry display: MM:SS for markets in/near window; "Xh Xm" for far-future
+      let expiryStr, tCol;
+      if (secs > 3600) {
+        const h = Math.floor(secs/3600), min = Math.floor((secs%3600)/60);
+        expiryStr = `${h}h ${min}m`;
+        tCol = 'dim';
+      } else if (secs > 0) {
+        const mins = Math.floor(secs/60), ss = secs%60;
+        expiryStr = `${mins}:${String(ss).padStart(2,'0')}`;
+        tCol = secs < 30 ? 'red' : secs < 60 ? 'yellow' : 'green';
+      } else {
+        expiryStr = 'expired';
+        tCol = 'red';
+      }
+      const inWindow = m.in_window;
+      const sigCol = active ? (active.signal === 'YES' ? 'green' : active.signal === 'NO' ? 'red' : 'dim') : 'dim';
+      const signal  = active ? active.signal : '—';
+      const edgePct = active ? `${active.edge_pct >= 0 ? '+' : ''}${fmt(active.edge_pct,2)}%` : '—';
+      const conf    = active ? fmt(active.confidence,2) : '—';
+      const inPos   = active ? active.in_position : false;
+      const statusStr = inWindow ? '<span class="green">ACTIVE</span>' : `<span class="dim">pending</span>`;
+      return `<tr ${inPos ? 'style="background:#1a2a1a"' : (inWindow ? '' : 'style="opacity:0.6"')}>
+        <td style="max-width:240px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">${m.question}</td>
+        <td class="green">${fmt(m.yes_price,4)}</td>
+        <td class="red">${fmt(m.no_price,4)}</td>
+        <td class="${tCol}">${expiryStr}</td>
+        <td class="${sigCol}">${signal}</td>
+        <td>${edgePct}</td>
+        <td class="dim">${conf}</td>
+        <td>${inPos ? '<span class="green">●</span>' : '<span class="dim">○</span>'}</td>
+        <td>${statusStr}</td>
+      </tr>`;
+    }).join('');
+  }
+}
+
+// ── Commands ──
+async function cmd(action, side) {
+  const body = { action, timestamp: Date.now() / 1000 };
+  if (side) body.side = side;
+  await fetch('/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const labels = { buy: side === 'YES' ? '⬆ BUY UP sent' : '⬇ BUY DOWN sent',
+                   pause: '⏸ Paused', start: '▶ Resumed' };
+  flash(labels[action] || action);
+}
+
+function flash(msg) {
+  const el = $('status-msg');
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.display = 'none'; }, 2500);
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === 'b') cmd('buy', 'YES');
+  else if (k === 's') cmd('buy', 'NO');
+  else if (k === 'p') cmd('pause');
+  else if (k === 'r') cmd('start');
+});
+
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>"""
 
 
-def _fetch_btc_price():
-    try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": "BTCUSDT"}, timeout=4,
-        )
-        return float(r.json()["price"])
-    except Exception:
-        return 0.0
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTTP SERVER
+# ─────────────────────────────────────────────────────────────────────────────
 
+class Handler(BaseHTTPRequestHandler):
 
-def _fetch_active_market():
-    """Search for BTC short-duration markets using /events API + flexible regex."""
-    searched = 0
-    matched  = 0
-    now      = time.time()
-    candidates = []
-
-    # Try /events endpoint first (same as bot.py — returns grouped events with sub-markets)
-    try:
-        r = requests.get(
-            "https://gamma-api.polymarket.com/events",
-            params={"active": "true", "closed": "false", "limit": 100},
-            timeout=6,
-        )
-        events = r.json()
-        for event in events:
-            searched += 1
-            slug  = (event.get("slug", "") or event.get("ticker", "")).lower()
-            title = (event.get("title", "") or event.get("question", "")).lower()
-
-            slug_match  = bool(_BTC_SLUG_RE.search(slug))
-            title_match = bool(_BTC_TITLE_RE.search(title))
-            if not (slug_match or title_match):
-                continue
-            matched += 1
-            if event.get("closed") or not event.get("active"):
-                continue
-
-            for m in event.get("markets", []):
-                try:
-                    end_ts = datetime.fromisoformat(
-                        m.get("endDate", "").replace("Z", "+00:00")
-                    ).timestamp()
-                except Exception:
-                    continue
-                # Reject long-duration markets (>30 min)
-                try:
-                    start_ts = datetime.fromisoformat(
-                        m.get("startDate", "").replace("Z", "+00:00")
-                    ).timestamp()
-                except Exception:
-                    start_ts = end_ts - 300
-                duration = end_ts - start_ts
-                if duration > 1800:
-                    continue
-
-                secs_left = end_ts - now
-                if secs_left > 10:
-                    candidates.append((secs_left, m))
-    except Exception:
+    def log_message(self, fmt, *args):  # silence default access logs
         pass
 
-    # Fallback: try /markets endpoint (flat list, catches individual market listings)
-    if not candidates:
-        try:
-            r = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"active": "true", "limit": 200}, timeout=6,
-            )
-            markets = r.json()
-            for m in markets:
-                searched += 1
-                q = m.get("question", "").lower()
-                if not _BTC_TITLE_RE.search(q):
-                    continue
-                matched += 1
-                try:
-                    end_ts = datetime.fromisoformat(
-                        m.get("endDate", "").replace("Z", "+00:00")
-                    ).timestamp()
-                except Exception:
-                    continue
-                secs_left = end_ts - now
-                if secs_left > 10:
-                    candidates.append((secs_left, m))
-        except Exception:
-            pass
+    def _send(self, code, content_type, body: bytes):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
 
-    # Update search stats for dashboard display
-    with _mkt.lock:
-        _mkt.search_stats = f"Scanned: {searched} | BTC matches: {matched} | Active: {len(candidates)}"
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send(200, "text/html; charset=utf-8", HTML.encode())
+        elif self.path == "/state":
+            try:
+                with open(STATE_FILE) as f:
+                    data = f.read()
+            except FileNotFoundError:
+                data = "{}"
+            self._send(200, "application/json", data.encode())
+        else:
+            self._send(404, "text/plain", b"Not found")
 
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
-
-
-def _fetch_clob_orderbook(token_id):
-    try:
-        r = requests.get(
-            "https://clob.polymarket.com/book",
-            params={"token_id": token_id}, timeout=4,
-        )
-        data = r.json()
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
-        return (float(bids[0]["price"]) if bids else 0.0,
-                float(asks[0]["price"]) if asks else 0.0)
-    except Exception:
-        return 0.0, 0.0
+    def do_POST(self):
+        if self.path == "/command":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            try:
+                cmd = json.loads(body)
+                with open(COMMAND_FILE, "w") as f:
+                    json.dump(cmd, f)
+                self._send(200, "application/json", b'{"ok":true}')
+            except Exception as e:
+                self._send(400, "application/json",
+                           json.dumps({"error": str(e)}).encode())
+        else:
+            self._send(404, "text/plain", b"Not found")
 
 
-def _data_loop():
-    while _running:
-        now = time.time()
-
-        if now - _mkt.last_btc_fetch >= 1:
-            price = _fetch_btc_price()
-            with _mkt.lock:
-                if price > 0:
-                    _mkt.btc_price      = price
-                    _mkt.last_btc_fetch = now
-                    if _mkt.price_to_beat == 0.0:
-                        _mkt.price_to_beat = price
-
-        if now - _mkt.last_poly_fetch >= 5:
-            m = _fetch_active_market()
-            if m:
-                tokens = m.get("tokens", [])
-                up_tok, dn_tok = "", ""
-                up_p, dn_p     = 0.0, 0.0
-                for tok in tokens:
-                    out = tok.get("outcome", "").upper()
-                    if out == "YES":
-                        up_tok = tok.get("token_id", "")
-                        up_p   = float(tok.get("price", 0.5))
-                    elif out == "NO":
-                        dn_tok = tok.get("token_id", "")
-                        dn_p   = float(tok.get("price", 0.5))
-
-                ub, ua = (up_p, up_p)
-                db, da = (dn_p, dn_p)
-                if up_tok:
-                    b, a = _fetch_clob_orderbook(up_tok)
-                    if b > 0 or a > 0: ub, ua = b, a
-                if dn_tok:
-                    b, a = _fetch_clob_orderbook(dn_tok)
-                    if b > 0 or a > 0: db, da = b, a
-
-                try:
-                    end_ts = datetime.fromisoformat(
-                        m.get("endDate", "").replace("Z", "+00:00")
-                    ).timestamp()
-                except Exception:
-                    end_ts = now + 300
-
-                new_cid = m.get("conditionId", "")
-                with _mkt.lock:
-                    if new_cid != _mkt.condition_id:
-                        _mkt.price_to_beat = _mkt.btc_price or 0.0
-                    _mkt.condition_id    = new_cid
-                    _mkt.question        = m.get("question", "")
-                    _mkt.end_ts          = end_ts
-                    _mkt.up_bid          = ub
-                    _mkt.up_ask          = ua
-                    _mkt.down_bid        = db
-                    _mkt.down_ask        = da
-                    _mkt.last_poly_fetch = now
-                    _mkt.error           = ""
-            else:
-                with _mkt.lock:
-                    _mkt.error           = "No active BTC market found"
-                    _mkt.last_poly_fetch = now
-
-        time.sleep(0.25)
-
-
-# ─────────────────────────────────────────────
-#  BOT STATE
-# ─────────────────────────────────────────────
-
-def load_bot_state():
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {"running": False, "paused": False, "mode": "paper",
-            "capital": 1000.0, "start_capital": 1000.0,
-            "wins": 0, "losses": 0, "open_trades": [], "uptime_seconds": 0}
-
-
-def send_command(cmd: dict):
-    try:
-        with open(COMMAND_FILE, "w") as f:
-            json.dump({**cmd, "timestamp": time.time()}, f)
-    except Exception:
-        pass
-
-
-# ─────────────────────────────────────────────
-#  SCREEN BUILDER  — single compact panel
-# ─────────────────────────────────────────────
-
-def _p(v: float) -> str:
-    return f"${v:,.2f}"
-
-
-def build_screen(snap: dict, bot: dict) -> str:
-    """Build a plain-text screen that works at any terminal width."""
-    now   = time.time()
-    w     = max(console.width or 80, 80)   # minimum 80 columns
-
-    secs  = max(0.0, snap["end_ts"] - now)
-    mins  = int(secs) // 60
-    secs2 = int(secs) % 60
-    pct   = max(0.0, min(1.0, secs / 300.0))
-
-    btc    = snap["btc_price"]
-    anchor = snap["price_to_beat"]
-    diff   = btc - anchor
-    dpct   = diff / anchor * 100 if anchor > 0 else 0.0
-
-    up_bid, up_ask = snap["up_bid"],  snap["up_ask"]
-    dn_bid, dn_ask = snap["down_bid"], snap["down_ask"]
-
-    capital   = bot.get("capital", 1000.0)
-    start_cap = bot.get("start_capital", 1000.0)
-    pnl       = capital - start_cap
-    wins      = bot.get("wins", 0)
-    losses    = bot.get("losses", 0)
-    mode      = bot.get("mode", "paper").upper()
-    running   = bot.get("running", False)
-    paused    = bot.get("paused", False)
-    open_n    = len(bot.get("open_trades", []))
-    uptime    = bot.get("uptime_seconds", 0)
-    uptime_s  = f"{uptime//3600:02d}:{(uptime%3600)//60:02d}:{uptime%60:02d}"
-
-    run_txt = "STOPPED" if not running else ("PAUSED" if paused else "RUNNING")
-    run_col = "red"     if not running else ("yellow" if paused else "green")
-
-    tc      = "red"   if secs < 30 else ("yellow" if secs < 60 else "green")
-    pc      = "green" if pnl >= 0 else "red"
-
-    q = snap["question"] or "Waiting for market..."
-    q = q[:w - 4]
-
-    bar_w  = max(10, w - 20)
-    filled = int(pct * bar_w)
-    bar    = "█" * filled + "░" * (bar_w - filled)
-
-    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1), expand=True)
-    t.add_column(style="dim",       width=14, no_wrap=True)
-    t.add_column(no_wrap=True)
-
-    def row(label, val, vc="white"):
-        t.add_row(label, Text(str(val), style=vc))
-
-    def sep():
-        t.add_row("", Text("─" * (w - 18), style="grey30"))
-
-    t.add_row("", Text(f"₿  {q}", style="bold yellow"))
-    sep()
-    # ── Single live BTC price (Binance is primary; HL oracle is hot-standby) ──
-    cl_price    = bot.get("chainlink_price", 0.0)
-    hl_price    = bot.get("hl_price",        0.0)
-    hl_funding  = bot.get("hl_funding",      0.0)
-    hl_oi_b     = bot.get("hl_oi_b",         0.0)
-    cvd_sig     = bot.get("cvd_signal",      0.0)
-    liq_sig     = bot.get("liq_signal",      0.0)
-    funding_sig = bot.get("funding_signal",  0.0)
-    oi_sig      = bot.get("oi_signal",       0.0)
-
-    # Show the one price the strategy acts on (Binance tick, HL oracle if down)
-    live_price = btc if btc > 0 else hl_price
-    live_src   = "Binance" if btc > 0 else ("HL oracle" if hl_price > 0 else "—")
-    row("BTC LIVE", f"{_p(live_price)}  [{live_src}]" if live_price > 0 else "fetching…", "bold cyan")
-
-    # Settlement delta — how far live price is ahead/behind Chainlink (the resolver)
-    settle = cl_price if cl_price > 0 else hl_price
-    if live_price > 0 and settle > 0:
-        s_diff = live_price - settle
-        s_pct  = s_diff / settle * 100
-        sign   = "+" if s_diff >= 0 else ""
-        settle_src = "CL" if cl_price > 0 else "HL"
-        row(
-            f"vs settle ({settle_src})",
-            f"{sign}{s_pct:.3f}%  {'leads ▲' if s_diff >= 0 else 'lags ▼'}",
-            "green" if s_diff >= 0 else "red",
-        )
-
-    if anchor > 0 and live_price > 0:
-        sign = "+" if diff >= 0 else ""
-        row("PRICE TO BEAT", f"{_p(anchor)}  ({sign}{dpct:.3f}%)", "bold yellow")
-
-    # Funding rate + OI — compact single line
-    if hl_price > 0:
-        fund_col = "red" if hl_funding > 0.02 else "green" if hl_funding < -0.02 else "dim"
-        row("Funding / OI", f"{hl_funding:+.4f}%/hr  |  OI ${hl_oi_b:.2f}B", fund_col)
-
-    sep()
-    cvd_txt    = f"{cvd_sig:+.1f}  {'bull div' if cvd_sig>0.5 else 'bear div' if cvd_sig<-0.5 else 'neutral'}"
-    liq_txt    = f"{liq_sig:+.2f}  {'short squeeze ▲' if liq_sig>0.2 else 'long liqs ▼' if liq_sig<-0.2 else 'balanced'}"
-    fund_s_txt = f"{funding_sig:+.1f}  {'overbought' if funding_sig<-0.3 else 'oversold' if funding_sig>0.3 else 'neutral'}"
-    oi_s_txt   = f"{oi_sig:+.1f}  {'growing' if oi_sig>0.1 else 'shrinking' if oi_sig<-0.1 else 'flat'}"
-    row("CVD",     cvd_txt,    "green" if cvd_sig    > 0 else "red" if cvd_sig    < 0 else "dim")
-    row("Liq",     liq_txt,    "green" if liq_sig    > 0 else "red" if liq_sig    < 0 else "dim")
-    row("Funding signal", fund_s_txt, "green" if funding_sig> 0 else "red" if funding_sig< 0 else "dim")
-    row("OI signal",      oi_s_txt,   "green" if oi_sig     > 0 else "red" if oi_sig     < 0 else "dim")
-    sep()
-    row("UP  bid/ask",   f"{up_bid:.4f} / {up_ask:.4f}  spread {up_ask-up_bid:.4f}", "green")
-    row("DOWN bid/ask",  f"{dn_bid:.4f} / {dn_ask:.4f}  spread {dn_ask-dn_bid:.4f}", "red")
-    sep()
-    row("BOT",    f"{mode}  {run_txt}  up {uptime_s}", run_col)
-    row("CAPITAL", f"{_p(capital)}  P&L {'+' if pnl>=0 else ''}{pnl:.2f}  W:{wins} L:{losses}  open:{open_n}", pc)
-    if snap["error"]:
-        row("⚠", snap["error"], "yellow")
-        if snap.get("search_stats"):
-            row("🔍", snap["search_stats"], "dim")
-    sep()
-    row(f"TIME {mins}:{secs2:02d}", Text(bar, style=tc), tc)
-    sep()
-    t.add_row("", Text("[B] UP  [S] DOWN  [P] Pause  [R] Resume  [Q] Quit"
-                       + (f"   ✓ {_status_msg}" if _status_msg else ""), style="dim"))
-
-    return Panel(t, box=box.ROUNDED, padding=(0, 0),
-                 title="[bold yellow]POLYMARKET BOT[/bold yellow]")
-
-
-# ─────────────────────────────────────────────
-#  KEYBOARD
-# ─────────────────────────────────────────────
-
-def _keyboard_loop():
-    global _running, _status_msg
-    try:
-        fd  = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while _running:
-                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if not rlist:
-                    continue
-                ch = sys.stdin.read(1).lower()
-                if ch == "q":
-                    _running = False
-                elif ch == "b":
-                    send_command({"action": "buy", "side": "YES"})
-                    _status_msg = "BUY UP sent"
-                elif ch == "s":
-                    send_command({"action": "buy", "side": "NO"})
-                    _status_msg = "BUY DOWN sent"
-                elif ch == "p":
-                    send_command({"action": "pause"})
-                    _status_msg = "paused"
-                elif ch == "r":
-                    send_command({"action": "start"})
-                    _status_msg = "resumed"
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except Exception:
-        pass
-
-
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global _running
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"  Dashboard running at  http://localhost:{PORT}")
+    print(f"  Press Ctrl-C to stop.")
 
-    threading.Thread(target=_data_loop,     daemon=True).start()
-    threading.Thread(target=_keyboard_loop, daemon=True).start()
+    # Open browser after a short delay (non-blocking)
+    def _open():
+        time.sleep(0.6)
+        webbrowser.open(f"http://localhost:{PORT}")
+    threading.Thread(target=_open, daemon=True).start()
 
-    with Live(console=console, screen=True, refresh_per_second=1, auto_refresh=True) as live:
-        while _running:
-            try:
-                live.update(build_screen(_mkt.snapshot(), load_bot_state()))
-            except Exception as e:
-                live.update(Panel(f"[red]Error: {e}[/red]", title="Error"))
-            time.sleep(0.25)
-
-    console.print("\n[dim]Dashboard closed.[/dim]\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nDashboard stopped.")
 
 
 if __name__ == "__main__":
