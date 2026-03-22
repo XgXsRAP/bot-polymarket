@@ -85,24 +85,19 @@ except ImportError:
 
 load_dotenv()
 
-# ── BTC market discovery regex (up/down short-duration markets only) ──
-_BTC_SLUG_RE = re.compile(
-    r"btc[-_/]?(up[-_]?down|updown|higher|lower|prediction|"
-    r"\d+[-_]?min|5m|15m|candle)",
-    re.IGNORECASE
-)
-_BTC_TITLE_RE = re.compile(
-    r"(?:btc|bitcoin|btc/usd).*?"
-    r"(?:up\s*(?:or|/|,)\s*down|"          # "up or down", "up/down"
-    r"go\s*up\s*or\s*(?:go\s*)?down|"      # "go up or down"
-    r"higher\s*or\s*lower|"                 # "higher or lower"
-    r"above\s*or\s*below|"                  # "above or below"
-    r"updown|"                              # "updown"
-    r"next\s+\d+\s*[-\s]?(?:min|minute|m)\b|"  # "next 5 minutes"
-    r"(?:\d+)\s*[-\s]?(?:min|minute|m)\b|"     # "5 min", "15-minute", "5m"
-    r"candle\b)",                               # "5-minute candle"
-    re.IGNORECASE
-)
+# ── Deterministic BTC market slug calculation ──
+# Polymarket's BTC 5-minute markets follow fixed timestamps divisible by 300.
+# The slug is: btc-updown-5m-{unix_timestamp_of_window_start}
+# We CALCULATE which market is active instead of scanning with regex.
+# This eliminates: indexing delay, pagination misses, regex fragility, race conditions.
+
+def _calculate_market_slug(asset: str = "btc", window_seconds: int = 300, offset: int = 0) -> str:
+    """Calculate the deterministic slug for the current market window.
+    offset: 0=current, -1=previous, 1=next"""
+    now = int(time.time())
+    window_start = now - (now % window_seconds) + (offset * window_seconds)
+    window_label = f"{window_seconds // 60}m"
+    return f"{asset}-updown-{window_label}-{window_start}"
 
 # ═══════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -136,6 +131,11 @@ class Config:
     wr_circuit_breaker_min: float = 0.30  # Pause if rolling win rate < 30%
     wr_circuit_breaker_window: int = 20   # Rolling window of last 20 trades
     wr_circuit_breaker_pause: int = 900   # Pause 15 minutes after WR breaker
+
+    # ── Price-target market settings (aggressive profile) ──
+    price_target_profit: float = 0.05    # 5% profit target (+$0.25 on $5)
+    price_target_stop: float = 0.02      # 2% stop loss (-$0.10 on $5) → R/R = 2.5:1
+    price_target_max_hold: int = 3600    # 1 hour max hold
 
     # ── Hold-to-expiry settings ──
     hold_to_expiry_threshold: float = 0.55  # Hold when price > 55% in our favor
@@ -187,7 +187,6 @@ class BTCPrice:
     change_1m: float = 0.0
     change_5m: float = 0.0
     volume: float = 0.0
-    source: str = "unknown"
 
 @dataclass
 class MarketContract:
@@ -200,6 +199,7 @@ class MarketContract:
     last_updated: float = field(default_factory=time.time)
     yes_token_id: str = ""   # CLOB token ID for YES side
     no_token_id: str  = ""   # CLOB token ID for NO side
+    market_type: str = "updown"  # "updown" (5m/15m) or "price_target" (≤1hr)
 
     @property
     def seconds_to_expiry(self) -> float:
@@ -517,7 +517,7 @@ class BTCPriceFeed:
                         if price > 0:
                             self._latency_ms = (time.perf_counter() - t0) * 1000
                             first = self.current is None
-                            self._update_price(price, source="rest")
+                            self._update_price(price)
                             if first:
                                 logger.info(f"💰 First BTC price from Kraken REST: ${price:,.2f}")
                         backoff = 5.0
@@ -533,7 +533,7 @@ class BTCPriceFeed:
             if price <= 0:
                 return
             first = self.current is None
-            self._update_price(price, volume=float(data.get("v", 0)), source="binance")
+            self._update_price(price, volume=float(data.get("v", 0)))
             if first:
                 logger.info(f"💰 First BTC price from Binance: ${price:,.2f}")
         except Exception as e:
@@ -553,13 +553,13 @@ class BTCPriceFeed:
                 return
             first = self.current is None
             volume = float(ticker.get("v", [0, 0])[1])  # 24h volume
-            self._update_price(price, volume=volume, source="kraken")
+            self._update_price(price, volume=volume)
             if first:
                 logger.info(f"💰 First BTC price from Kraken: ${price:,.2f}")
         except Exception as e:
             logger.warning(f"Kraken parse error: {e} | raw={str(raw)[:80]}")
 
-    def _update_price(self, price: float, volume: float = 0.0, source: str = "unknown"):
+    def _update_price(self, price: float, volume: float = 0.0):
         self._price_history.append(price)
         hist = list(self._price_history)
         change_1m = (price - hist[-60]) / hist[-60] if len(hist) >= 60 else 0.0
@@ -569,8 +569,7 @@ class BTCPriceFeed:
             timestamp=time.time(),
             change_1m=change_1m,
             change_5m=change_5m,
-            volume=volume,
-            source=source,
+            volume=volume
         )
 
     def stop(self):
@@ -578,269 +577,236 @@ class BTCPriceFeed:
 
 
 # ═══════════════════════════════════════════════════════════
-#  POLYMARKET MARKET FEED (WebSocket + REST)
+#  POLYMARKET MARKET FEED — Deterministic Slug-Based Finder
 # ═══════════════════════════════════════════════════════════
 
 class PolymarketFeed:
-    """Fetches and tracks active BTC 5-min markets from Polymarket."""
+    """
+    Finds and tracks active BTC 5-min/15-min markets on Polymarket.
+
+    DETERMINISTIC APPROACH (replaces regex scanning):
+    ─────────────────────────────────────────────────
+    Every BTC 5-minute market has a predictable slug:
+      btc-updown-5m-{unix_timestamp}
+
+    where the timestamp is the start of the 5-minute window, always
+    divisible by 300. We CALCULATE the slug from the clock, then query
+    the Gamma API for that exact event. One targeted API call, zero regex.
+
+    This fixes:
+      • Indexing delay — we query by slug, bypassing scan latency
+      • Pagination burial — direct lookup, no scanning 200 results
+      • Regex fragility — slug is pure math, no string matching
+      • Race conditions — fallback to previous window if gap
+    """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.markets: dict[str, MarketContract] = {}
         self._running = False
         self._session: Optional[aiohttp.ClientSession] = None
+        self._last_slug: str = ""           # Track current slug to detect window changes
+        self._consecutive_misses: int = 0   # How many cycles we failed to find a market
 
     async def start(self):
         self._session = aiohttp.ClientSession()
         self._running = True
-        # Fetch markets every 30 seconds
-        asyncio.create_task(self._poll_markets())
-        # Subscribe to price updates via WebSocket
+        # Deterministic market discovery — runs every 5 seconds
+        asyncio.create_task(self._poll_deterministic())
+        # Subscribe to price updates via WebSocket (keeps working for live prices)
         asyncio.create_task(self._ws_prices())
 
-    async def _poll_markets(self):
-        """Discover active BTC 5m/15m markets.
+    async def _poll_deterministic(self):
+        """
+        Find the current BTC 5-min and 15-min markets by calculating
+        their slugs and querying the Gamma API directly.
 
-        Polymarket pre-publishes 5-minute markets ~24h in advance.
-        Sorting by endDate ascending (soonest expiry first) ensures the
-        currently running 5-min market(s) appear at the top of the 200-item
-        result, rather than tomorrow's pre-published batch.
+        Runs every 5 seconds. Each cycle:
+        1. Calculate slug for current 5-min window (and 15-min if enabled)
+        2. Query GET /events?slug=<slug> — ONE targeted call per window size
+        3. Parse the response into a MarketContract
+        4. If current window not indexed yet, try previous window as fallback
         """
         while self._running:
             try:
-                url = f"{self.cfg.gamma_api_url}/markets"
-                params = {
-                    "active":    "true",
-                    "closed":    "false",
-                    "limit":     200,
-                    "order":     "endDate",
-                    "ascending": "true",    # soonest expiry first → today's running markets
-                }
-                async with self._session.get(url, params=params,
-                                              timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                    if resp.status == 200:
-                        markets_flat = await resp.json()
-                        await self._process_markets_flat(markets_flat)
-                    else:
-                        logger.warning(f"Gamma /markets returned HTTP {resp.status}")
+                now = time.time()
+
+                # ── Determine which window sizes to query ──
+                win_filter = self.cfg.market_window_seconds
+                windows_to_check = []
+                if win_filter == 0:
+                    windows_to_check = [300, 900]   # Both 5m and 15m
+                elif win_filter == 300:
+                    windows_to_check = [300]         # 5m only
+                elif win_filter == 900:
+                    windows_to_check = [900]         # 15m only
+                else:
+                    windows_to_check = [300, 900]
+
+                found_any = False
+
+                for window_secs in windows_to_check:
+                    # Try current window first
+                    slug = _calculate_market_slug("btc", window_secs, offset=0)
+                    market = await self._fetch_by_slug(slug, window_secs)
+
+                    # Fallback: try previous window if current not indexed yet
+                    # (handles first ~10 seconds of a new window)
+                    if not market:
+                        prev_slug = _calculate_market_slug("btc", window_secs, offset=-1)
+                        market = await self._fetch_by_slug(prev_slug, window_secs)
+                        # Only use previous window if it hasn't expired
+                        if market and market.seconds_to_expiry < 15:
+                            market = None
+                        elif market:
+                            slug = prev_slug
+
+                    if market:
+                        found_any = True
+                        cid = market.condition_id
+                        is_new = cid not in self.markets
+                        self.markets[cid] = market
+
+                        if is_new:
+                            logger.success(
+                                f"🎯 FOUND via slug: {slug}\n"
+                                f"   Question: {market.question[:70]}\n"
+                                f"   YES: ${market.yes_price:.4f} | NO: ${market.no_price:.4f} | "
+                                f"Expiry: {market.seconds_to_expiry:.0f}s"
+                            )
+
+                # Prune expired markets
+                expired = [cid for cid, m in self.markets.items() if m.seconds_to_expiry < -10]
+                for cid in expired:
+                    del self.markets[cid]
+
+                # Diagnostics
+                if found_any:
+                    self._consecutive_misses = 0
+                else:
+                    self._consecutive_misses += 1
+                    if self._consecutive_misses <= 3 or self._consecutive_misses % 12 == 0:
+                        slugs_tried = [_calculate_market_slug("btc", w) for w in windows_to_check]
+                        logger.warning(
+                            f"⚠️  No market found (miss #{self._consecutive_misses}) | "
+                            f"Slugs tried: {slugs_tried}"
+                        )
+
             except Exception as e:
-                logger.warning(f"Market poll error: {e}")
-            await asyncio.sleep(10)
+                logger.warning(f"Deterministic poll error: {e}")
 
-    async def _process_markets_flat(self, markets: list):
-        """Process a flat list of market objects (from /markets endpoint).
+            await asyncio.sleep(5)
 
-        Each item is a single market dict with question, endDate, clobTokenIds, etc.
-        The BTC regex is applied to the question field directly.
+    async def _fetch_by_slug(self, slug: str, window_seconds: int) -> Optional[MarketContract]:
         """
-        new_count        = 0
-        now              = time.time()
-        searched         = 0
-        matched          = 0
-        rejected_expired = 0
-        rejected_long    = 0
+        Query Gamma API for a specific event slug.
+        Returns a MarketContract or None.
 
-        for m in markets:
-            searched += 1
-            question = (m.get("question", "") or m.get("title", "")).lower()
-            slug     = (m.get("slug", "") or m.get("ticker", "")).lower()
+        This is ONE targeted API call instead of scanning hundreds of markets.
+        URL: GET https://gamma-api.polymarket.com/events?slug=<slug>
+        """
+        try:
+            url = f"{self.cfg.gamma_api_url}/events"
+            params = {"slug": slug}
 
-            slug_match  = bool(_BTC_SLUG_RE.search(slug))
-            title_match = bool(_BTC_TITLE_RE.search(question))
-            if not (slug_match or title_match):
-                continue
-            matched += 1
-            logger.debug(f"  /markets match: '{question[:80]}'")
+            async with self._session.get(
+                url, params=params,
+                timeout=aiohttp.ClientTimeout(total=6)
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug(f"Gamma API returned HTTP {resp.status} for slug={slug}")
+                    return None
 
-            cid = m.get("conditionId", "")
-            if not cid:
-                continue
+                events = await resp.json()
+                if not events:
+                    logger.debug(f"No event found for slug: {slug}")
+                    return None
 
-            try:
-                expiry_ts = datetime.fromisoformat(
-                    m.get("endDate", "").replace("Z", "+00:00")
-                ).timestamp()
-            except Exception:
-                expiry_ts = now + 300
-            if expiry_ts <= now:
-                rejected_expired += 1
-                ago = int(now - expiry_ts)
-                logger.warning(f"   ⏰ Expired {ago}s ago: '{m.get('question','')[:60]}' | endDate={m.get('endDate','?')}")
-                continue
+                # Events endpoint returns a list — take the first match
+                event = events[0] if isinstance(events, list) else events
+                markets = event.get("markets", [])
+                if not markets:
+                    logger.debug(f"Event found but no markets inside: {slug}")
+                    return None
 
-            # Skip markets expiring more than 2 hours away — these are pre-published
-            # future markets (tomorrow's batch). We only want today's running/near markets.
-            if expiry_ts > now + 7200:
-                rejected_long += 1
-                continue
-
-            try:
-                start_ts = datetime.fromisoformat(
-                    m.get("startDate", "").replace("Z", "+00:00")
-                ).timestamp()
-            except Exception:
-                start_ts = expiry_ts - 300
-
-            # NOTE: Polymarket pre-publishes 5-min markets ~24h in advance.
-            # We only track markets expiring within 2 hours (get_active_markets handles
-            # the tradeable window via seconds_to_expiry: 30–1200s before endDate).
-
-            try:
-                prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
-            except Exception:
-                prices = [0.5, 0.5]
-            yes_price = float(prices[0]) if prices else 0.5
-            no_price  = float(prices[1]) if len(prices) > 1 else round(1 - yes_price, 4)
-
-            try:
-                token_ids = json.loads(m.get("clobTokenIds", "[]"))
-            except Exception:
-                token_ids = []
-            yes_token = str(token_ids[0]) if len(token_ids) > 0 else ""
-            no_token  = str(token_ids[1]) if len(token_ids) > 1 else ""
-
-            contract = MarketContract(
-                condition_id=cid,
-                question=m.get("question", ""),
-                yes_price=yes_price,
-                no_price=no_price,
-                expiry_ts=expiry_ts,
-                start_ts=start_ts,
-                yes_token_id=yes_token,
-                no_token_id=no_token,
-            )
-            if cid not in self.markets:
-                new_count += 1
-                secs_left = int(expiry_ts - now)
-                logger.debug(f"  New market: '{m.get('question','?')[:60]}' | {secs_left}s to expiry")
-            self.markets[cid] = contract
-
-        # Prune stale expired entries so get_active_markets() stays clean
-        expired_keys = [cid for cid, m in self.markets.items() if m.expiry_ts <= now]
-        for k in expired_keys:
-            del self.markets[k]
-        if expired_keys:
-            logger.debug(f"   🗑️  Pruned {len(expired_keys)} expired market(s) from tracker")
-
-        logger.info(
-            f"📡 Market scan (/markets): {searched} items | {matched} BTC matches | "
-            f"{rejected_expired} expired | {rejected_long} future | "
-            f"{len(self.markets)} tracked ({new_count} new)"
-        )
-        if matched > 0 and len(self.markets) == 0:
-            logger.warning(
-                f"⚠️  {matched} BTC markets found but all expired — "
-                f"see ⏰ lines above for exact endDates"
-            )
-        elif searched > 0 and matched == 0:
-            logger.warning("⚠️  Regex matched 0 BTC markets. Sample of API response:")
-            for m in markets[:5]:
-                q = m.get("question", m.get("title", "?"))
-                logger.warning(f"   RAW: '{q[:80]}' endDate={m.get('endDate','?')}")
-
-    async def _process_events(self, events):
-        """Extract BTC up/down + price-target markets from events."""
-        new_count       = 0
-        now             = time.time()
-        searched        = 0
-        matched         = 0
-        rejected_closed = 0
-        rejected_expired = 0
-        rejected_long   = 0
-
-        for event in events:
-            searched += 1
-            slug  = (event.get("slug", "") or event.get("ticker", "")).lower()
-            title = (event.get("title", "") or event.get("question", "")).lower()
-
-            # Accept if slug OR title matches up/down short-duration pattern
-            slug_match  = bool(_BTC_SLUG_RE.search(slug))
-            title_match = bool(_BTC_TITLE_RE.search(title))
-            if not (slug_match or title_match):
-                continue
-            matched += 1
-            logger.debug(f"  BTC match: '{title[:80]}' (slug={slug[:40]})")
-            if event.get("closed") or not event.get("active"):
-                rejected_closed += 1
-                continue
-
-            for m in event.get("markets", []):
+                m = markets[0]  # One market per up/down event
                 cid = m.get("conditionId", "")
                 if not cid:
-                    continue
+                    return None
 
-                # Parse expiry — skip already expired
+                # Parse prices
+                try:
+                    prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
+                except (json.JSONDecodeError, TypeError):
+                    prices = [0.5, 0.5]
+                yes_price = float(prices[0]) if len(prices) > 0 else 0.5
+                no_price = float(prices[1]) if len(prices) > 1 else round(1 - yes_price, 4)
+
+                # Parse token IDs
+                try:
+                    token_ids = json.loads(m.get("clobTokenIds", "[]"))
+                except (json.JSONDecodeError, TypeError):
+                    token_ids = []
+                yes_token = str(token_ids[0]) if len(token_ids) > 0 else ""
+                no_token = str(token_ids[1]) if len(token_ids) > 1 else ""
+
+                # Parse timestamps
+                now = time.time()
                 try:
                     expiry_ts = datetime.fromisoformat(
                         m.get("endDate", "").replace("Z", "+00:00")
                     ).timestamp()
                 except Exception:
-                    expiry_ts = now + 300
-                if expiry_ts <= now:
-                    rejected_expired += 1
-                    logger.debug(f"    Expired: '{m.get('question','?')[:60]}' endDate={m.get('endDate','?')}")
-                    continue
-
-                # Parse start timestamp (used to detect 5-min vs 15-min window)
+                    expiry_ts = now + window_seconds
                 try:
                     start_ts = datetime.fromisoformat(
                         m.get("startDate", "").replace("Z", "+00:00")
                     ).timestamp()
                 except Exception:
-                    start_ts = expiry_ts - 300  # Assume 5-min if unknown
+                    start_ts = expiry_ts - window_seconds
 
-                # YES/NO prices
-                try:
-                    prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
-                except Exception:
-                    prices = [0.5, 0.5]
-                yes_price = float(prices[0]) if prices else 0.5
-                no_price  = float(prices[1]) if len(prices) > 1 else round(1 - yes_price, 4)
+                # Fetch LIVE orderbook prices from CLOB (more accurate than Gamma mid-prices)
+                if yes_token:
+                    clob_bid, clob_ask = await self._fetch_clob_book(yes_token)
+                    if clob_bid > 0 and clob_ask > 0:
+                        yes_price = round((clob_bid + clob_ask) / 2, 4)
+                        no_price = round(1 - yes_price, 4)
 
-                # Token IDs for live order placement
-                try:
-                    token_ids = json.loads(m.get("clobTokenIds", "[]"))
-                except Exception:
-                    token_ids = []
-                yes_token = str(token_ids[0]) if len(token_ids) > 0 else ""
-                no_token  = str(token_ids[1]) if len(token_ids) > 1 else ""
-
-                contract = MarketContract(
+                return MarketContract(
                     condition_id=cid,
-                    question=m.get("question", ""),
+                    question=m.get("question", event.get("title", "")),
                     yes_price=yes_price,
                     no_price=no_price,
                     expiry_ts=expiry_ts,
                     start_ts=start_ts,
                     yes_token_id=yes_token,
                     no_token_id=no_token,
+                    market_type="updown",
                 )
 
-                if cid not in self.markets:
-                    new_count += 1
-                    win = int(expiry_ts - start_ts)
-                    logger.debug(f"  New market: {m.get('question','?')[:60]} | window={win}s")
-                self.markets[cid] = contract
+        except asyncio.TimeoutError:
+            logger.debug(f"Timeout fetching slug: {slug}")
+            return None
+        except Exception as e:
+            logger.debug(f"Error fetching slug {slug}: {e}")
+            return None
 
-        # Diagnostic logging — always log scan stats so user can see what happened
-        logger.info(
-            f"📡 Market scan: {searched} events | {matched} BTC matches | "
-            f"{rejected_closed} closed | {rejected_expired} expired | "
-            f"{rejected_long} too long | "
-            f"{len(self.markets)} tracked ({new_count} new)"
-        )
-        # Enhanced diagnostics when no markets found
-        if len(self.markets) == 0 and matched > 0:
-            logger.warning(
-                f"⚠️  {matched} BTC events found but ALL filtered out: "
-                f"{rejected_closed} closed, {rejected_expired} expired, "
-                f"{rejected_long} too long"
-            )
-        elif matched == 0:
-            logger.warning(
-                f"⚠️  No BTC markets in {searched} events. "
-                f"Polymarket may not have active BTC prediction markets right now."
-            )
+    async def _fetch_clob_book(self, token_id: str) -> tuple[float, float]:
+        """Fetch best bid/ask from the CLOB orderbook."""
+        try:
+            url = f"{self.cfg.clob_rest_url}/book"
+            async with self._session.get(
+                url, params={"token_id": token_id},
+                timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                data = await resp.json()
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                best_bid = float(bids[0]["price"]) if bids else 0.0
+                best_ask = float(asks[0]["price"]) if asks else 0.0
+                return best_bid, best_ask
+        except Exception:
+            return 0.0, 0.0
 
     async def _ws_prices(self):
         """Subscribe to real-time price updates via Polymarket WebSocket."""
@@ -872,24 +838,12 @@ class PolymarketFeed:
 
             except websockets.exceptions.InvalidStatus as e:
                 status = getattr(e.response, "status_code", None)
-                # Permanent errors — stop retrying, REST polling will continue
-                if status == 451:
+                if status in (404, 451, 403, 410):
                     logger.error(
-                        "❌ Polymarket WS blocked (HTTP 451 — geo-restriction). "
-                        "Use a VPN. Falling back to REST polling (30s updates)."
+                        f"❌ Polymarket WS error (HTTP {status}) — "
+                        f"falling back to REST polling. Bot continues normally."
                     )
                     return
-                if status == 404:
-                    logger.error(
-                        "❌ Polymarket WS endpoint not found (HTTP 404). "
-                        "The WebSocket URL may have changed. "
-                        "Falling back to REST polling (30s updates) — bot continues normally."
-                    )
-                    return
-                if status in (403, 410):
-                    logger.error(f"❌ Polymarket WS permanent error (HTTP {status}) — falling back to REST polling.")
-                    return
-                # Transient errors — retry with backoff
                 logger.warning(f"Polymarket WS rejected (HTTP {status}) — retrying in {backoff:.0f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
@@ -904,7 +858,6 @@ class PolymarketFeed:
             if data.get("type") == "book":
                 cid = data.get("market_id", "")
                 if cid in self.markets:
-                    # Update YES/NO prices from order book data
                     bids = data.get("bids", [])
                     asks = data.get("asks", [])
                     if bids and asks:
@@ -920,19 +873,17 @@ class PolymarketFeed:
     def get_active_markets(self) -> list[MarketContract]:
         """
         Return markets that haven't expired and are still tradeable.
-        If cfg.market_window_seconds > 0, only returns markets matching that window:
-          300 → 5-min markets only
-          900 → 15-min markets only
-          0   → all windows (default)
+        With deterministic discovery, this is much simpler — we only
+        track markets we found by slug, so no regex filtering needed.
         """
         result = []
         for m in self.markets.values():
             if not (30 < m.seconds_to_expiry < 1200):
                 continue
-            # Window filter (optional)
+            # Window filter (optional — already applied during discovery)
             win_filter = self.cfg.market_window_seconds
             if win_filter > 0 and m.window_seconds > 0:
-                if abs(m.window_seconds - win_filter) > 120:   # ±2 min tolerance
+                if abs(m.window_seconds - win_filter) > 120:
                     continue
             result.append(m)
         return result
@@ -1715,9 +1666,15 @@ class PositionMonitor:
         seconds_held = time.time() - trade.entry_time
         seconds_to_expiry = contract.seconds_to_expiry
 
-        profit_target = self.cfg.min_profit_target   # 2.5%
-        stop_loss     = self.cfg.stop_loss_pct       # 1.0%
-        max_hold      = self.cfg.max_hold_seconds    # 270s
+        # Select strategy profile based on market type
+        if contract.market_type == "price_target":
+            profit_target = self.cfg.price_target_profit      # 5%
+            stop_loss = self.cfg.price_target_stop             # 2%
+            max_hold = self.cfg.price_target_max_hold          # 3600s
+        else:
+            profit_target = self.cfg.min_profit_target         # 2.5%
+            stop_loss = self.cfg.stop_loss_pct                 # 1.0%
+            max_hold = self.cfg.max_hold_seconds               # 270s
 
         # === HOLD TO EXPIRY MODE ===
         # If price moved strongly in our favor, skip scalp target and ride to $1.00
@@ -1726,11 +1683,9 @@ class PositionMonitor:
             (trade.side == "YES" and current_price >= self.cfg.hold_to_expiry_threshold) or
             (trade.side == "NO" and current_price >= self.cfg.hold_to_expiry_threshold)
         )
-        # Sticky momentum: 1m must confirm OR 5m trend still points our way
-        # (prevents a brief BTC pause from kicking us out of hold mode)
         momentum_confirms = (
-            (trade.side == "YES" and (btc.change_1m > 0 or btc.change_5m > 0.001)) or
-            (trade.side == "NO"  and (btc.change_1m < 0 or btc.change_5m < -0.001))
+            (trade.side == "YES" and btc.change_1m > 0) or
+            (trade.side == "NO" and btc.change_1m < 0)
         )
         hold_to_expiry = (
             in_our_favor
@@ -1916,7 +1871,6 @@ class PolymarketBot:
                     "capital": self.risk.capital,
                     "start_capital": self.risk.daily_start_capital,
                     "btc_price": btc.price if btc else 0.0,
-                    "btc_source": btc.source if btc else "unknown",
                     "btc_change_1m": btc.change_1m if btc else 0.0,
                     "btc_change_5m": btc.change_5m if btc else 0.0,
                     "chainlink_price":  self.chainlink.price,
@@ -1932,21 +1886,6 @@ class PolymarketBot:
                     "open_trades": open_list,
                     "active_markets": markets_info,
                     "markets_tracked": len(active_markets),
-                    "markets_total": len(self.poly_feed.markets),
-                    "tracked_markets_detail": [
-                        {
-                            "condition_id": m.condition_id[:12] + "…",
-                            "question":     m.question[:60],
-                            "yes_price":    round(m.yes_price, 4),
-                            "no_price":     round(m.no_price, 4),
-                            "seconds_to_expiry": round(m.seconds_to_expiry),
-                            "in_window":    30 < m.seconds_to_expiry < 1200,
-                        }
-                        for m in sorted(
-                            self.poly_feed.markets.values(),
-                            key=lambda m: m.seconds_to_expiry
-                        )[:20]
-                    ],
                     "last_latency_ms": self.btc_feed.latency_ms,
                     "scan_count": self._scan_count,
                     "consecutive_losses": self.risk.consecutive_losses,
