@@ -1,0 +1,444 @@
+"""
+POLYMARKET BTC UP/DOWN — COMPACT TERMINAL DASHBOARD
+Run: python3 dashboard.py
+
+Keyboard controls:
+  [B] Buy UP      [S] Buy DOWN
+  [P] Pause bot   [R] Resume bot
+  [Q] Quit
+"""
+
+import json
+import os
+import re
+import select
+import sys
+import termios
+import threading
+import time
+import tty
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import requests
+
+# ── Deterministic BTC market slug calculation (same as bot.py) ──
+# No regex scanning needed — we calculate the slug from the clock.
+def _calculate_market_slug(asset="btc", window_seconds=300, offset=0):
+    """Calculate the deterministic slug for the current market window."""
+    import time as _t
+    now = int(_t.time())
+    window_start = now - (now % window_seconds) + (offset * window_seconds)
+    window_label = f"{window_seconds // 60}m"
+    return f"{asset}-updown-{window_label}-{window_start}"
+from rich import box
+from rich.align import Align
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+# ── Paths ──
+STATE_FILE   = "data/bot_state.json"
+COMMAND_FILE = "data/bot_commands.json"
+Path("data").mkdir(exist_ok=True)
+
+console = Console()
+
+_running    = True
+_status_msg = ""
+
+# ─────────────────────────────────────────────
+#  MARKET STATE
+# ─────────────────────────────────────────────
+
+class MarketState:
+    def __init__(self):
+        self.lock            = threading.Lock()
+        self.question        = ""
+        self.condition_id    = ""
+        self.end_ts          = 0.0
+        self.up_bid          = 0.0
+        self.up_ask          = 0.0
+        self.down_bid        = 0.0
+        self.down_ask        = 0.0
+        self.price_to_beat   = 0.0
+        self.btc_price       = 0.0
+        self.last_poly_fetch = 0.0
+        self.last_btc_fetch  = 0.0
+        self.error           = ""
+        self.search_stats    = ""   # e.g. "Scanned: 150 | Matched: 2 | Active: 1"
+
+    def snapshot(self):
+        with self.lock:
+            return self.__dict__.copy()
+
+_mkt = MarketState()
+
+
+def _fetch_btc_price():
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": "BTCUSDT"}, timeout=4,
+        )
+        return float(r.json()["price"])
+    except Exception:
+        return 0.0
+
+
+def _fetch_active_market():
+    """Find the current BTC 5-min market by calculating the slug directly.
+
+    Instead of scanning 200 markets with regex, we compute the slug from
+    the current time: btc-updown-5m-{unix_timestamp} and query for it.
+    Falls back to the previous window if the current one isn't indexed yet.
+    """
+    now = time.time()
+
+    for window_secs in [300, 900]:  # Try 5-min first, then 15-min
+        # Try current window
+        slug = _calculate_market_slug("btc", window_secs, offset=0)
+        market = _fetch_market_by_slug(slug)
+        if market:
+            with _mkt.lock:
+                _mkt.search_stats = f"Found via slug: {slug}"
+            return market
+
+        # Fallback: previous window (handles first ~10s of new window)
+        prev_slug = _calculate_market_slug("btc", window_secs, offset=-1)
+        market = _fetch_market_by_slug(prev_slug)
+        if market:
+            # Only use if it hasn't expired yet
+            try:
+                end_ts = datetime.fromisoformat(
+                    market.get("endDate", "").replace("Z", "+00:00")
+                ).timestamp()
+                if end_ts - now > 10:
+                    with _mkt.lock:
+                        _mkt.search_stats = f"Found via slug: {prev_slug} (prev window)"
+                    return market
+            except Exception:
+                pass
+
+    with _mkt.lock:
+        _mkt.search_stats = f"No market found | slug: {_calculate_market_slug('btc', 300)}"
+    return None
+
+
+def _fetch_market_by_slug(slug):
+    """Query Gamma API for a specific event slug. Returns the market dict or None."""
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/events",
+            params={"slug": slug},
+            timeout=6,
+        )
+        if r.status_code != 200:
+            return None
+        events = r.json()
+        if not events:
+            return None
+        event = events[0] if isinstance(events, list) else events
+        markets = event.get("markets", [])
+        if not markets:
+            return None
+        return markets[0]
+    except Exception:
+        return None
+
+
+def _fetch_clob_orderbook(token_id):
+    try:
+        r = requests.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": token_id}, timeout=4,
+        )
+        data = r.json()
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        return (float(bids[0]["price"]) if bids else 0.0,
+                float(asks[0]["price"]) if asks else 0.0)
+    except Exception:
+        return 0.0, 0.0
+
+
+def _data_loop():
+    while _running:
+        now = time.time()
+
+        if now - _mkt.last_btc_fetch >= 1:
+            price = _fetch_btc_price()
+            with _mkt.lock:
+                if price > 0:
+                    _mkt.btc_price      = price
+                    _mkt.last_btc_fetch = now
+                    if _mkt.price_to_beat == 0.0:
+                        _mkt.price_to_beat = price
+
+        if now - _mkt.last_poly_fetch >= 5:
+            m = _fetch_active_market()
+            if m:
+                tokens = m.get("tokens", [])
+                up_tok, dn_tok = "", ""
+                up_p, dn_p     = 0.0, 0.0
+                for tok in tokens:
+                    out = tok.get("outcome", "").upper()
+                    if out == "YES":
+                        up_tok = tok.get("token_id", "")
+                        up_p   = float(tok.get("price", 0.5))
+                    elif out == "NO":
+                        dn_tok = tok.get("token_id", "")
+                        dn_p   = float(tok.get("price", 0.5))
+
+                ub, ua = (up_p, up_p)
+                db, da = (dn_p, dn_p)
+                if up_tok:
+                    b, a = _fetch_clob_orderbook(up_tok)
+                    if b > 0 or a > 0: ub, ua = b, a
+                if dn_tok:
+                    b, a = _fetch_clob_orderbook(dn_tok)
+                    if b > 0 or a > 0: db, da = b, a
+
+                try:
+                    end_ts = datetime.fromisoformat(
+                        m.get("endDate", "").replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    end_ts = now + 300
+
+                new_cid = m.get("conditionId", "")
+                with _mkt.lock:
+                    if new_cid != _mkt.condition_id:
+                        _mkt.price_to_beat = _mkt.btc_price or 0.0
+                    _mkt.condition_id    = new_cid
+                    _mkt.question        = m.get("question", "")
+                    _mkt.end_ts          = end_ts
+                    _mkt.up_bid          = ub
+                    _mkt.up_ask          = ua
+                    _mkt.down_bid        = db
+                    _mkt.down_ask        = da
+                    _mkt.last_poly_fetch = now
+                    _mkt.error           = ""
+            else:
+                with _mkt.lock:
+                    _mkt.error           = "No active BTC market found"
+                    _mkt.last_poly_fetch = now
+
+        time.sleep(0.25)
+
+
+# ─────────────────────────────────────────────
+#  BOT STATE
+# ─────────────────────────────────────────────
+
+def load_bot_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"running": False, "paused": False, "mode": "paper",
+            "capital": 1000.0, "start_capital": 1000.0,
+            "wins": 0, "losses": 0, "open_trades": [], "uptime_seconds": 0}
+
+
+def send_command(cmd: dict):
+    try:
+        with open(COMMAND_FILE, "w") as f:
+            json.dump({**cmd, "timestamp": time.time()}, f)
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
+#  SCREEN BUILDER  — single compact panel
+# ─────────────────────────────────────────────
+
+def _p(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def build_screen(snap: dict, bot: dict) -> str:
+    """Build a plain-text screen that works at any terminal width."""
+    now   = time.time()
+    w     = max(console.width or 80, 80)   # minimum 80 columns
+
+    secs  = max(0.0, snap["end_ts"] - now)
+    mins  = int(secs) // 60
+    secs2 = int(secs) % 60
+    pct   = max(0.0, min(1.0, secs / 300.0))
+
+    btc    = snap["btc_price"]
+    anchor = snap["price_to_beat"]
+    diff   = btc - anchor
+    dpct   = diff / anchor * 100 if anchor > 0 else 0.0
+
+    up_bid, up_ask = snap["up_bid"],  snap["up_ask"]
+    dn_bid, dn_ask = snap["down_bid"], snap["down_ask"]
+
+    capital   = bot.get("capital", 1000.0)
+    start_cap = bot.get("start_capital", 1000.0)
+    pnl       = capital - start_cap
+    wins      = bot.get("wins", 0)
+    losses    = bot.get("losses", 0)
+    mode      = bot.get("mode", "paper").upper()
+    running   = bot.get("running", False)
+    paused    = bot.get("paused", False)
+    open_n    = len(bot.get("open_trades", []))
+    uptime    = bot.get("uptime_seconds", 0)
+    uptime_s  = f"{uptime//3600:02d}:{(uptime%3600)//60:02d}:{uptime%60:02d}"
+
+    run_txt = "STOPPED" if not running else ("PAUSED" if paused else "RUNNING")
+    run_col = "red"     if not running else ("yellow" if paused else "green")
+
+    tc      = "red"   if secs < 30 else ("yellow" if secs < 60 else "green")
+    pc      = "green" if pnl >= 0 else "red"
+
+    q = snap["question"] or "Waiting for market..."
+    q = q[:w - 4]
+
+    bar_w  = max(10, w - 20)
+    filled = int(pct * bar_w)
+    bar    = "█" * filled + "░" * (bar_w - filled)
+
+    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1), expand=True)
+    t.add_column(style="dim",       width=14, no_wrap=True)
+    t.add_column(no_wrap=True)
+
+    def row(label, val, vc="white"):
+        t.add_row(label, Text(str(val), style=vc))
+
+    def sep():
+        t.add_row("", Text("─" * (w - 18), style="grey30"))
+
+    t.add_row("", Text(f"₿  {q}", style="bold yellow"))
+    sep()
+    # ── Single live BTC price (Binance is primary; HL oracle is hot-standby) ──
+    cl_price    = bot.get("chainlink_price", 0.0)
+    hl_price    = bot.get("hl_price",        0.0)
+    hl_funding  = bot.get("hl_funding",      0.0)
+    hl_oi_b     = bot.get("hl_oi_b",         0.0)
+    cvd_sig     = bot.get("cvd_signal",      0.0)
+    liq_sig     = bot.get("liq_signal",      0.0)
+    funding_sig = bot.get("funding_signal",  0.0)
+    oi_sig      = bot.get("oi_signal",       0.0)
+
+    # Show the one price the strategy acts on (Binance tick, HL oracle if down)
+    live_price = btc if btc > 0 else hl_price
+    live_src   = "Binance" if btc > 0 else ("HL oracle" if hl_price > 0 else "—")
+    row("BTC LIVE", f"{_p(live_price)}  [{live_src}]" if live_price > 0 else "fetching…", "bold cyan")
+
+    # Settlement delta — how far live price is ahead/behind Chainlink (the resolver)
+    settle = cl_price if cl_price > 0 else hl_price
+    if live_price > 0 and settle > 0:
+        s_diff = live_price - settle
+        s_pct  = s_diff / settle * 100
+        sign   = "+" if s_diff >= 0 else ""
+        settle_src = "CL" if cl_price > 0 else "HL"
+        row(
+            f"vs settle ({settle_src})",
+            f"{sign}{s_pct:.3f}%  {'leads ▲' if s_diff >= 0 else 'lags ▼'}",
+            "green" if s_diff >= 0 else "red",
+        )
+
+    if anchor > 0 and live_price > 0:
+        sign = "+" if diff >= 0 else ""
+        row("PRICE TO BEAT", f"{_p(anchor)}  ({sign}{dpct:.3f}%)", "bold yellow")
+
+    # Funding rate + OI — compact single line
+    if hl_price > 0:
+        fund_col = "red" if hl_funding > 0.02 else "green" if hl_funding < -0.02 else "dim"
+        row("Funding / OI", f"{hl_funding:+.4f}%/hr  |  OI ${hl_oi_b:.2f}B", fund_col)
+
+    sep()
+    cvd_txt    = f"{cvd_sig:+.1f}  {'bull div' if cvd_sig>0.5 else 'bear div' if cvd_sig<-0.5 else 'neutral'}"
+    liq_txt    = f"{liq_sig:+.2f}  {'short squeeze ▲' if liq_sig>0.2 else 'long liqs ▼' if liq_sig<-0.2 else 'balanced'}"
+    fund_s_txt = f"{funding_sig:+.1f}  {'overbought' if funding_sig<-0.3 else 'oversold' if funding_sig>0.3 else 'neutral'}"
+    oi_s_txt   = f"{oi_sig:+.1f}  {'growing' if oi_sig>0.1 else 'shrinking' if oi_sig<-0.1 else 'flat'}"
+    row("CVD",     cvd_txt,    "green" if cvd_sig    > 0 else "red" if cvd_sig    < 0 else "dim")
+    row("Liq",     liq_txt,    "green" if liq_sig    > 0 else "red" if liq_sig    < 0 else "dim")
+    row("Funding signal", fund_s_txt, "green" if funding_sig> 0 else "red" if funding_sig< 0 else "dim")
+    row("OI signal",      oi_s_txt,   "green" if oi_sig     > 0 else "red" if oi_sig     < 0 else "dim")
+    sep()
+    row("UP  bid/ask",   f"{up_bid:.4f} / {up_ask:.4f}  spread {up_ask-up_bid:.4f}", "green")
+    row("DOWN bid/ask",  f"{dn_bid:.4f} / {dn_ask:.4f}  spread {dn_ask-dn_bid:.4f}", "red")
+    sep()
+    row("BOT",    f"{mode}  {run_txt}  up {uptime_s}", run_col)
+    row("CAPITAL", f"{_p(capital)}  P&L {'+' if pnl>=0 else ''}{pnl:.2f}  W:{wins} L:{losses}  open:{open_n}", pc)
+    if snap["error"]:
+        row("⚠", snap["error"], "yellow")
+        if snap.get("search_stats"):
+            row("🔍", snap["search_stats"], "dim")
+    sep()
+    row(f"TIME {mins}:{secs2:02d}", Text(bar, style=tc), tc)
+    sep()
+    t.add_row("", Text("[B] UP  [S] DOWN  [P] Pause  [R] Resume  [Q] Quit"
+                       + (f"   ✓ {_status_msg}" if _status_msg else ""), style="dim"))
+
+    return Panel(t, box=box.ROUNDED, padding=(0, 0),
+                 title="[bold yellow]POLYMARKET BOT[/bold yellow]")
+
+
+# ─────────────────────────────────────────────
+#  KEYBOARD
+# ─────────────────────────────────────────────
+
+def _keyboard_loop():
+    global _running, _status_msg
+    try:
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while _running:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not rlist:
+                    continue
+                ch = sys.stdin.read(1).lower()
+                if ch == "q":
+                    _running = False
+                elif ch == "b":
+                    send_command({"action": "buy", "side": "YES"})
+                    _status_msg = "BUY UP sent"
+                elif ch == "s":
+                    send_command({"action": "buy", "side": "NO"})
+                    _status_msg = "BUY DOWN sent"
+                elif ch == "p":
+                    send_command({"action": "pause"})
+                    _status_msg = "paused"
+                elif ch == "r":
+                    send_command({"action": "start"})
+                    _status_msg = "resumed"
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    global _running
+
+    threading.Thread(target=_data_loop,     daemon=True).start()
+    threading.Thread(target=_keyboard_loop, daemon=True).start()
+
+    with Live(console=console, screen=True, refresh_per_second=1, auto_refresh=True) as live:
+        while _running:
+            try:
+                live.update(build_screen(_mkt.snapshot(), load_bot_state()))
+            except Exception as e:
+                live.update(Panel(f"[red]Error: {e}[/red]", title="Error"))
+            time.sleep(0.25)
+
+    console.print("\n[dim]Dashboard closed.[/dim]\n")
+
+
+if __name__ == "__main__":
+    main()
