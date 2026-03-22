@@ -98,6 +98,13 @@ _BTC_TITLE_RE = re.compile(
     r"(?:\d+)\s*[-\s]?(?:min|minute|m)\b)",  # "5 min", "15-minute", "5m"
     re.IGNORECASE
 )
+# Price-target BTC markets: "Will Bitcoin hit $90K?", "BTC above $85000", etc.
+_BTC_PRICE_RE = re.compile(
+    r"(?:btc|bitcoin).*?"
+    r"(?:price|hit|reach|above|below|over|under)\s*"
+    r"\$?\d",
+    re.IGNORECASE
+)
 
 # ═══════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -131,6 +138,14 @@ class Config:
     wr_circuit_breaker_min: float = 0.30  # Pause if rolling win rate < 30%
     wr_circuit_breaker_window: int = 20   # Rolling window of last 20 trades
     wr_circuit_breaker_pause: int = 900   # Pause 15 minutes after WR breaker
+
+    # ── Price-target market settings (aggressive profile) ──
+    price_target_profit: float = 0.05    # 5% profit target (+$0.25 on $5)
+    price_target_stop: float = 0.02      # 2% stop loss (-$0.10 on $5) → R/R = 2.5:1
+    price_target_max_hold: int = 3600    # 1 hour max hold
+
+    # ── Hold-to-expiry settings ──
+    hold_to_expiry_threshold: float = 0.55  # Hold when price > 55% in our favor
 
     # ── Speed & Latency ──
     target_latency_ms: int = 100        # Target 100ms execution
@@ -191,6 +206,7 @@ class MarketContract:
     last_updated: float = field(default_factory=time.time)
     yes_token_id: str = ""   # CLOB token ID for YES side
     no_token_id: str  = ""   # CLOB token ID for NO side
+    market_type: str = "updown"  # "updown" (5m/15m) or "price_target" (≤1hr)
 
     @property
     def seconds_to_expiry(self) -> float:
@@ -596,7 +612,7 @@ class PolymarketFeed:
                 params = {
                     "active":    "true",
                     "closed":    "false",
-                    "limit":     100,
+                    "limit":     200,
                     "order":     "endDate",
                     "ascending": "true",
                 }
@@ -611,7 +627,7 @@ class PolymarketFeed:
             await asyncio.sleep(30)
 
     async def _process_events(self, events):
-        """Extract BTC up/down markets from events (5m and 15m windows)."""
+        """Extract BTC up/down + price-target markets from events."""
         new_count       = 0
         now             = time.time()
         searched        = 0
@@ -625,10 +641,11 @@ class PolymarketFeed:
             slug  = (event.get("slug", "") or event.get("ticker", "")).lower()
             title = (event.get("title", "") or event.get("question", "")).lower()
 
-            # Accept if slug OR title/question matches BTC up/down pattern (flexible regex)
+            # Accept if slug, title, OR price-target pattern matches
             slug_match  = bool(_BTC_SLUG_RE.search(slug))
             title_match = bool(_BTC_TITLE_RE.search(title))
-            if not (slug_match or title_match):
+            price_match = bool(_BTC_PRICE_RE.search(title))
+            if not (slug_match or title_match or price_match):
                 continue
             matched += 1
             if event.get("closed") or not event.get("active"):
@@ -659,9 +676,11 @@ class PolymarketFeed:
                 except Exception:
                     start_ts = expiry_ts - 300  # Assume 5-min if unknown
 
-                # Reject long-duration markets (>30 min) — not suitable for HFT
+                # Determine market type and max allowed duration
+                is_price_target = price_match and not (slug_match or title_match)
+                max_duration = 3600 if is_price_target else 1800  # 1hr for price targets, 30min for up/down
                 duration = expiry_ts - start_ts
-                if duration > 1800:
+                if duration > max_duration:
                     rejected_long += 1
                     logger.debug(f"  Skipping long market ({int(duration)}s): {m.get('question','?')[:60]}")
                     continue
@@ -691,6 +710,7 @@ class PolymarketFeed:
                     start_ts=start_ts,
                     yes_token_id=yes_token,
                     no_token_id=no_token,
+                    market_type="price_target" if is_price_target else "updown",
                 )
 
                 if cid not in self.markets:
@@ -706,6 +726,18 @@ class PolymarketFeed:
             f"{rejected_long} too long | "
             f"{len(self.markets)} tracked ({new_count} new)"
         )
+        # Enhanced diagnostics when no markets found
+        if len(self.markets) == 0 and matched > 0:
+            logger.warning(
+                f"⚠️  {matched} BTC events found but ALL filtered out: "
+                f"{rejected_closed} closed, {rejected_expired} expired, "
+                f"{rejected_long} too long"
+            )
+        elif matched == 0:
+            logger.warning(
+                f"⚠️  No BTC markets in {searched} events. "
+                f"Polymarket may not have active BTC prediction markets right now."
+            )
 
     async def _ws_prices(self):
         """Subscribe to real-time price updates via Polymarket WebSocket."""
@@ -890,27 +922,38 @@ class EnhancedSignalFeed:
 
     def _update_liquidations(self):
         """
-        Compare long vs short liquidations from Binance + OKX last batch.
+        Blended liquidation signal from two sources:
+        1. Binance/OKX executed liquidations (what already happened)
+        2. Hyperliquid near-liquidation pressure (what's about to happen)
+
         More short liqs (forced short covering) → bullish  → +1.0
         More long liqs  (forced long selling)   → bearish  → -1.0
         """
         try:
+            # Source 1: Executed liquidations from Binance + OKX
+            exchange_signal = 0.0
             liqs = self._api.get_all_liquidations("1h")
-            if not liqs:
-                self.liq_signal = 0.0
-                return
+            if liqs:
+                long_usd  = sum(l["value"] for l in liqs if l.get("side") == "long")
+                short_usd = sum(l["value"] for l in liqs if l.get("side") == "short")
+                total     = long_usd + short_usd
+                if total > 0:
+                    exchange_signal = (short_usd - long_usd) / total
 
-            long_usd  = sum(l["value"] for l in liqs if l.get("side") == "long")
-            short_usd = sum(l["value"] for l in liqs if l.get("side") == "short")
-            total     = long_usd + short_usd
+            # Source 2: Near-liquidation pressure from Hyperliquid
+            hl_pressure = 0.0
+            try:
+                lp = self._api.get_liquidation_pressure("BTC")
+                hl_pressure = lp.get("liq_pressure", 0.0)
+            except Exception:
+                pass
 
-            if total == 0:
-                self.liq_signal = 0.0
-                return
-
-            # More long liqs → bearish pressure; more short liqs → bullish pressure
-            self.liq_signal = (short_usd - long_usd) / total
-            logger.debug(f"Liq signal={self.liq_signal:+.2f} long=${long_usd/1e6:.2f}M short=${short_usd/1e6:.2f}M")
+            # Blend: 60% near-liquidation pressure + 40% executed liquidations
+            self.liq_signal = 0.6 * hl_pressure + 0.4 * exchange_signal
+            logger.debug(
+                f"Liq signal={self.liq_signal:+.2f} "
+                f"(HL pressure={hl_pressure:+.2f}, exchange={exchange_signal:+.2f})"
+            )
         except Exception as e:
             logger.debug(f"Liq update error: {e}")
 
@@ -1013,10 +1056,10 @@ class SignalEngine:
         adj_cl_dev   = min(max(cl_deviation  * 15,   -0.12), 0.12)  # strongest signal
         momentum_adj = (adj_cl_dev * 0.5 + adj_1m * 0.35 + adj_5m * 0.15)
 
-        cvd_adj     = cvd_signal     * 0.08
-        liq_adj     = liq_signal     * 0.06
+        cvd_adj     = cvd_signal     * 0.07   # Cumulative volume delta
+        liq_adj     = liq_signal     * 0.10   # Near-liquidation pressure (increased from 0.06)
         funding_adj = funding_signal * 0.05   # High positive funding → bearish pressure
-        oi_adj      = oi_signal      * 0.04   # Growing OI → trend has conviction
+        oi_adj      = oi_signal      * 0.03   # Growing OI → trend has conviction
 
         fair_value = 0.50 + momentum_adj + cvd_adj + liq_adj + funding_adj + oi_adj
         return min(max(fair_value, 0.02), 0.98)
@@ -1538,10 +1581,15 @@ Rules:
 class PositionMonitor:
     """
     Monitors open positions and triggers exits when:
-    1. Profit target reached
-    2. Stop loss hit
-    3. Position timeout (approaching market expiry)
-    4. Market conditions flip
+    1. Hold-to-expiry mode (ride winners to $1.00 settlement)
+    2. Profit target reached (scalp exit)
+    3. Stop loss hit
+    4. Position timeout (approaching market expiry)
+    5. Market conditions flip
+
+    Uses dual strategy profiles:
+    - Up/Down (5m/15m): 2.5% profit / 1.0% stop → R/R = 2.5:1
+    - Price Target (≤1hr): 5.0% profit / 2.0% stop → R/R = 2.5:1
     """
 
     def __init__(self, cfg: Config):
@@ -1564,22 +1612,72 @@ class PositionMonitor:
         seconds_held = time.time() - trade.entry_time
         seconds_to_expiry = contract.seconds_to_expiry
 
-        # 1. Profit target: Take 50% of theoretical max (as per strategy)
-        # Strategy: buy YES at 0.51, target is 0.38 profit (to 0.89)
-        # We simplify: exit when pnl% > min_profit_target
-        if unrealized_pnl_pct >= self.cfg.min_profit_target:
+        # Select strategy profile based on market type
+        if contract.market_type == "price_target":
+            profit_target = self.cfg.price_target_profit      # 5%
+            stop_loss = self.cfg.price_target_stop             # 2%
+            max_hold = self.cfg.price_target_max_hold          # 3600s
+        else:
+            profit_target = self.cfg.min_profit_target         # 2.5%
+            stop_loss = self.cfg.stop_loss_pct                 # 1.0%
+            max_hold = self.cfg.max_hold_seconds               # 270s
+
+        # === HOLD TO EXPIRY MODE ===
+        # If price moved strongly in our favor, skip scalp target and ride to $1.00
+        # Worst case: trailing stop at entry price = break-even (no loss)
+        in_our_favor = (
+            (trade.side == "YES" and current_price >= self.cfg.hold_to_expiry_threshold) or
+            (trade.side == "NO" and current_price >= self.cfg.hold_to_expiry_threshold)
+        )
+        momentum_confirms = (
+            (trade.side == "YES" and btc.change_1m > 0) or
+            (trade.side == "NO" and btc.change_1m < 0)
+        )
+        hold_to_expiry = (
+            in_our_favor
+            and momentum_confirms
+            and unrealized_pnl_pct > 0
+            and seconds_to_expiry > 60
+        )
+
+        if hold_to_expiry:
+            logger.debug(
+                f"🎯 HOLD TO EXPIRY | {trade.trade_id} | {trade.side} @ "
+                f"${current_price:.4f} (entry ${trade.entry_price:.4f}) | "
+                f"{seconds_to_expiry:.0f}s remaining"
+            )
+            # Break-even trailing stop: exit if price drops back to entry
+            if current_price <= trade.entry_price:
+                return True, current_price, "hold_expiry_trailing_stop"
+            # Near-expiry final exit: let market settle
+            if seconds_to_expiry < 15:
+                return True, current_price, "hold_expiry_final_exit"
+            # Strong reversal: exit to protect gains
+            strong_reversal = (
+                (trade.side == "YES" and btc.change_1m < -0.005) or
+                (trade.side == "NO" and btc.change_1m > 0.005)
+            )
+            if strong_reversal:
+                return True, current_price, "hold_expiry_reversal"
+            # HOLD — don't exit, ride to settlement
+            return False, current_price, ""
+
+        # === NORMAL SCALP EXIT LOGIC ===
+
+        # 1. Profit target (2.5% for up/down, 5% for price targets)
+        if unrealized_pnl_pct >= profit_target:
             return True, current_price, f"profit_target ({unrealized_pnl_pct*100:.2f}%)"
 
-        # 2. Stop loss: configurable (default -1.0%, R/R = 2.5:1)
-        if unrealized_pnl_pct <= -self.cfg.stop_loss_pct:
+        # 2. Stop loss (1.0% for up/down, 2.0% for price targets)
+        if unrealized_pnl_pct <= -stop_loss:
             return True, current_price, f"stop_loss ({unrealized_pnl_pct*100:.2f}%)"
 
         # 3. Timeout: close 30 seconds before expiry
         if seconds_to_expiry < 30:
             return True, current_price, "expiry_approaching"
 
-        # 4. Max hold time
-        if seconds_held > self.cfg.max_hold_seconds:
+        # 4. Max hold time (270s for up/down, 3600s for price targets)
+        if seconds_held > max_hold:
             return True, current_price, "max_hold_timeout"
 
         # 5. Signal reversal: price moved against us strongly
