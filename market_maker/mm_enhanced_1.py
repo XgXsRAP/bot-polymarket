@@ -41,6 +41,13 @@ try:
 except ImportError:
     HAS_HL_FEED = False
 
+# ── Polymarket dynamic fee model ──
+from fees import (
+    polymarket_taker_fee, polymarket_taker_fee_amount,
+    polymarket_maker_rebate_amount, net_fill_fee, minimum_profitable_spread,
+    GAS_COST_PER_TX,
+)
+
 # ═══════════════════════════════════════════════════════════
 #  PART 1: SIDE DATA INTEGRATION
 #
@@ -165,7 +172,7 @@ class EnhancedFairValueEngine:
         # fair value should be LOWER than pure price action suggests.
         # This is one of the few side data signals that affects fair value
         # directly (not just spread width).
-        cvd_adj = data.cvd_signal * 0.02   # Max ±2% fair value shift
+        cvd_adj = 0.0  # CVD disabled for fair value (backtest: -$0.45 value, hurts P&L)
 
         # ── Tier 3: Regime (conviction weighting) ──
         # If funding is very high (+ve = longs crowded), the market is
@@ -218,9 +225,9 @@ class EnhancedQuoteEngine:
        in the last 60 seconds.
     """
 
-    def __init__(self, base_spread: float = 0.04, max_spread: float = 0.12,
-                 base_size: float = 20.0, max_inventory: float = 100.0,
-                 skew_factor: float = 0.002):
+    def __init__(self, base_spread: float = 0.06, max_spread: float = 0.12,
+                 base_size: float = 5.0, max_inventory: float = 100.0,
+                 skew_factor: float = 0.0):
         self.base_spread = base_spread
         self.max_spread = max_spread
         self.base_size = base_size
@@ -257,6 +264,12 @@ class EnhancedQuoteEngine:
         spread += liq_adj
         adjustments["liquidation"] = round(liq_adj, 4)
 
+        # Layer 2.5: CVD-based spread widening (NOT fair value — spread only)
+        # High absolute CVD means one-sided flow — higher adverse selection risk.
+        cvd_spread_adj = abs(data.cvd_signal) * 0.01  # Max +1c from one-sided flow
+        spread += cvd_spread_adj
+        adjustments["cvd_spread"] = round(cvd_spread_adj, 4)
+
         # Layer 3: Funding rate extremity
         # Normal funding (~0): no adjustment
         # Extreme funding (>0.3 signal): up to +1.5¢ wider
@@ -291,6 +304,10 @@ class EnhancedQuoteEngine:
 
         # Cap at maximum spread
         spread = min(spread, self.max_spread)
+
+        # Fee floor: never quote tighter than cost to fill
+        fee_floor = minimum_profitable_spread(fair_value) + 0.001
+        spread = max(spread, fee_floor)
         adjustments["final_spread"] = round(spread, 4)
 
         half_spread = spread / 2
@@ -385,14 +402,14 @@ class EnhancedQuoteEngine:
 class BacktestConfig:
     """Parameters for a single backtest run."""
     # Spread settings to test
-    base_spread: float = 0.04
+    base_spread: float = 0.06
     max_spread: float = 0.12
     volatility_multiplier: float = 5.0
 
     # Inventory settings
     max_inventory: float = 100.0
-    skew_factor: float = 0.002
-    quote_size: float = 20.0
+    skew_factor: float = 0.0
+    quote_size: float = 5.0
 
     # Side data toggles (turn on/off to measure their impact)
     use_liquidation_data: bool = True
@@ -406,6 +423,11 @@ class BacktestConfig:
     adverse_fill_pct: float = 0.25      # 25% of fills are adverse (price moves against us)
     ticks_per_market: int = 300         # ~5 min of data at 1 tick/second
     num_markets: int = 100              # Number of markets to simulate
+
+    # Fee modeling — Polymarket dynamic fees (March 2026)
+    market_category: str = "crypto"     # Fee category (crypto peaks at 1.8% taker)
+    maker_fill_fraction: float = 0.80   # 80% of fills are maker (resting order hit)
+    include_gas: bool = True            # Include Polygon gas cost per fill
 
 
 @dataclass
@@ -423,6 +445,10 @@ class BacktestResult:
     pnl_per_fill: float = 0.0
     sharpe_ratio: float = 0.0          # Risk-adjusted return
     max_drawdown: float = 0.0          # Worst peak-to-trough
+    total_fees_paid: float = 0.0       # Total taker fees across all fills
+    total_rebates_earned: float = 0.0  # Total maker rebates earned
+    total_gas_cost: float = 0.0        # Total gas across all txs
+    net_fee_impact: float = 0.0        # rebates - fees - gas
 
 
 class MarketMakingBacktester:
@@ -557,6 +583,9 @@ class MarketMakingBacktester:
         peak_pnl = 0.0
         max_drawdown = 0.0
         spreads = []
+        total_fees = 0.0
+        total_rebates = 0.0
+        total_gas = 0.0
 
         for market_idx in range(config.num_markets):
             # Generate one market's worth of data
@@ -609,6 +638,23 @@ class MarketMakingBacktester:
                     buy_fills.append(buy_price)
                     max_inv = max(max_inv, abs(inventory))
 
+                    # Apply fee/rebate on bid fill
+                    is_maker = random.random() < config.maker_fill_fraction
+                    fill_fee = net_fill_fee(
+                        buy_price, quotes["size"], is_maker=is_maker,
+                        category=config.market_category,
+                        include_gas=config.include_gas,
+                    )
+                    running_pnl -= fill_fee  # negative fill_fee = rebate (adds to pnl)
+                    if is_maker:
+                        total_rebates += polymarket_maker_rebate_amount(
+                            buy_price, quotes["size"], config.market_category)
+                    else:
+                        total_fees += polymarket_taker_fee_amount(
+                            buy_price, quotes["size"], config.market_category)
+                    if config.include_gas:
+                        total_gas += GAS_COST_PER_TX
+
                     # Adverse selection check: did the price immediately move
                     # against us after the fill?
                     if random.random() < config.adverse_fill_pct:
@@ -622,12 +668,28 @@ class MarketMakingBacktester:
                     sell_price = quotes["yes_ask"]
                     inventory -= quotes["size"]
 
+                    # Apply fee/rebate on ask fill
+                    is_maker = random.random() < config.maker_fill_fraction
+                    fill_fee = net_fill_fee(
+                        sell_price, quotes["size"], is_maker=is_maker,
+                        category=config.market_category,
+                        include_gas=config.include_gas,
+                    )
+
                     # Match with earliest buy for round-trip P&L
                     buy_price = buy_fills.pop(0)
-                    trip_pnl = (sell_price - buy_price) * quotes["size"]
+                    trip_pnl = (sell_price - buy_price) * quotes["size"] - fill_fee
                     spread_pnl += trip_pnl
                     running_pnl += trip_pnl
                     round_trips += 1
+                    if is_maker:
+                        total_rebates += polymarket_maker_rebate_amount(
+                            sell_price, quotes["size"], config.market_category)
+                    else:
+                        total_fees += polymarket_taker_fee_amount(
+                            sell_price, quotes["size"], config.market_category)
+                    if config.include_gas:
+                        total_gas += GAS_COST_PER_TX
 
                 # Track P&L series for drawdown calculation
                 pnl_series.append(running_pnl)
@@ -650,6 +712,8 @@ class MarketMakingBacktester:
         else:
             sharpe = 0.0
 
+        net_fee = total_rebates - total_fees - total_gas
+
         result = BacktestResult(
             config_name=config_name,
             total_fills=total_fills,
@@ -663,6 +727,10 @@ class MarketMakingBacktester:
             pnl_per_fill=round(running_pnl / total_fills, 4) if total_fills > 0 else 0,
             sharpe_ratio=round(sharpe, 2),
             max_drawdown=round(max_drawdown, 4),
+            total_fees_paid=round(total_fees, 4),
+            total_rebates_earned=round(total_rebates, 4),
+            total_gas_cost=round(total_gas, 4),
+            net_fee_impact=round(net_fee, 4),
         )
         return result
 
@@ -687,7 +755,7 @@ class MarketMakingBacktester:
         # ════════════════════════════════════════════════════
         print("\n📊 TEST 1: Spread Width Optimization")
         print("=" * 70)
-        for spread in [0.02, 0.03, 0.04, 0.05, 0.06, 0.08]:
+        for spread in [0.04, 0.05, 0.06, 0.07, 0.08, 0.10]:
             cfg = BacktestConfig(base_spread=spread)
             r = self.run_single_backtest(cfg, f"spread_{spread*100:.0f}c")
             results.append(r)
@@ -976,6 +1044,8 @@ def run_backtest():
     print(f"   Sharpe Ratio: {best.sharpe_ratio:+.2f}")
     print(f"   Max Drawdown: ${best.max_drawdown:.2f}")
     print(f"   P&L per fill: ${best.pnl_per_fill:+.4f}")
+    print(f"   Fees paid: ${best.total_fees_paid:.4f} | Rebates: ${best.total_rebates_earned:.4f} | Gas: ${best.total_gas_cost:.4f}")
+    print(f"   Net fee impact: ${best.net_fee_impact:+.4f}")
     print(f"   Max Inventory: {best.max_inventory:.0f} shares")
     print(f"{'='*70}")
 
