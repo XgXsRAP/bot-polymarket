@@ -1,19 +1,21 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║   POLYMARKET BTC BOT — BACKTESTING ENGINE                    ║
+║   POLYMARKET BTC BOT — DIRECTIONAL BACKTESTING ENGINE        ║
 ║                                                              ║
-║   Simulates the signal engine against historical BTC data    ║
-║   to validate strategy parameters before risking real money. ║
+║   ⚠️  DEPRECATED — Use `python mm_enhanced_1.py --backtest`  ║
+║   instead. The MM backtest has proven superior results:       ║
+║     - MM backtest Sharpe: +1.61 vs this backtest: -93.37     ║
+║     - This strategy: 19.5% win rate, -60% P&L               ║
 ║                                                              ║
-║   Usage:                                                     ║
-║     python backtest.py                          # defaults   ║
-║     python backtest.py --days 30 --capital 500  # custom     ║
-║     python backtest.py --optimize                # grid scan ║
+║   Root causes of failure:                                    ║
+║     - Market sim lag factor (0.85) creates mean-reversion    ║
+║       trap that doesn't exist in real markets                ║
+║     - Fees (3.6% round-trip) exceed profit target (2.5%)     ║
+║     - Stop loss (1%) triggers before fee cost is realized    ║
+║     - 78.5% of exits are stop losses — no exploitable edge   ║
 ║                                                              ║
-║   Output:                                                    ║
-║     data/backtest_results.json   — full trade log            ║
-║     data/backtest_summary.json   — performance metrics       ║
-║     data/optimization_grid.json  — parameter scan results    ║
+║   This file is kept for reference. Use the MM backtest:      ║
+║     python mm_enhanced_1.py --backtest                       ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -28,11 +30,16 @@ from pathlib import Path
 from typing import Optional
 from itertools import product as cart_product
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 try:
     import requests
 except ImportError:
     print("❌ Missing: pip install requests")
     raise SystemExit(1)
+
+from fees import polymarket_taker_fee, GAS_COST_PER_TX
 
 
 # ═══════════════════════════════════════════════════════════
@@ -77,11 +84,14 @@ class BacktestConfig:
     market_window_seconds: int = 300     # 5-minute prediction windows
 
     # ── Fee Modeling ──
-    # Polymarket charges taker fees that vary by price (highest at 50%).
-    # We use 1% as a conservative flat approximation.
+    # Polymarket uses dynamic taker fees: parabolic curve peaking at 50%.
+    # Crypto markets: up to 1.80% at p=0.50, approaches 0% near p=0 or p=1.
+    # Formula: fee_rate = max_fee * 4 * p * (1 - p)
     # Gas costs on Polygon are small but add up over many trades.
-    taker_fee_pct: float = 0.01          # 1% taker fee per fill
-    gas_cost_per_trade: float = 0.005    # ~$0.005 per Polygon transaction
+    use_dynamic_fees: bool = True         # True = price-dependent fees from fees.py
+    taker_fee_pct_override: float = 0.018 # Fallback flat rate if dynamic disabled
+    market_category: str = "crypto"       # Fee category (crypto peaks at 1.8%)
+    gas_cost_per_trade: float = 0.005     # ~$0.005 per Polygon transaction
 
     # ── Backtest Period ──
     lookback_days: int = 7
@@ -505,8 +515,12 @@ def run_backtest(
                 # Apply slippage on exit
                 slippage = cfg.simulated_slippage
                 exit_price = current_price * (1 - slippage) if current_price > trade.entry_price else current_price * (1 + slippage)
-                # Apply taker fee + gas on exit
-                exit_fee = trade.shares * exit_price * cfg.taker_fee_pct + cfg.gas_cost_per_trade
+                # Apply dynamic taker fee + gas on exit
+                if cfg.use_dynamic_fees:
+                    exit_fee_rate = polymarket_taker_fee(exit_price, cfg.market_category)
+                else:
+                    exit_fee_rate = cfg.taker_fee_pct_override
+                exit_fee = trade.shares * exit_price * exit_fee_rate + cfg.gas_cost_per_trade
 
                 trade.exit_price = exit_price
                 trade.exit_time = now
@@ -560,8 +574,12 @@ def run_backtest(
                 position_size = round(min(base_size * confidence_mult, state.capital * cfg.max_trade_pct), 2)
 
                 entry_price = (yes_price if signal == "YES" else no_price)
-                # Apply slippage + taker fee on entry
-                entry_price = entry_price * (1 + cfg.simulated_slippage + cfg.taker_fee_pct)
+                # Apply slippage + dynamic taker fee on entry
+                if cfg.use_dynamic_fees:
+                    entry_fee_rate = polymarket_taker_fee(entry_price, cfg.market_category)
+                else:
+                    entry_fee_rate = cfg.taker_fee_pct_override
+                entry_price = entry_price * (1 + cfg.simulated_slippage + entry_fee_rate)
                 # Deduct gas cost from position size
                 position_size = max(0, position_size - cfg.gas_cost_per_trade)
                 shares = position_size / entry_price if entry_price > 0 else 0
