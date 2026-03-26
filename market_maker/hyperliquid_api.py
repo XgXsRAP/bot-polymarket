@@ -14,7 +14,7 @@
 ║  Usage:                                                          ║
 ║    feed = HyperliquidFeed()                                      ║
 ║    await feed.start()                                            ║
-║    snapshot = feed.get_snapshot()  # returns SideDataSnapshot     ║
+║    snapshot = feed.get_snapshotA()  # returns SideDataSnapshot     ║
 ║    await feed.stop()                                             ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
@@ -42,7 +42,7 @@ HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 # Signal normalization parameters (tuned for BTC perps)
 FUNDING_NORM = 0.0003      # funding_rate / this → tanh input. 0.03%/hr maps to ~0.71
 OI_CHANGE_NORM = 0.005     # 0.5% OI change in 15 min maps to ~0.71
-CVD_AMPLIFIER = 3.0        # amplify normalized CVD before tanh
+CVD_AMPLIFIER = 1.0        # reduced from 3.0 to prevent saturation (70/30 split → 0.38 not 0.83)
 LIQ_CLUSTER_WINDOW_MS = 500    # ms window to detect liquidation clusters
 LIQ_CLUSTER_MIN_TRADES = 5    # minimum trades in window to flag as liquidation
 LIQ_SIZE_THRESHOLD_MULT = 2.0 # size must be 2x rolling avg to count
@@ -313,7 +313,7 @@ class HyperliquidWSFeed:
         now = time.time()
         if now - self._last_liq_decay > 1.0:
             elapsed = now - self._last_liq_decay
-            decay = math.exp(-elapsed / 30.0)  # 30-second half-life
+            decay = math.exp(-elapsed / 15.0)  # 15-second half-life (was 30s, faster fade)
             self._liq_intensity *= decay
             self._liq_direction *= decay
             self._last_liq_decay = now
@@ -401,7 +401,7 @@ class HyperliquidWSFeed:
 
         # Normalize direction by intensity
         raw = self._liq_direction / max(self._liq_intensity, 1e-6)
-        return math.tanh(raw * self._liq_intensity * 0.1)
+        return math.tanh(raw * self._liq_intensity * 0.03)  # reduced from 0.1 to stay in [-0.5,+0.5]
 
 
 # ═══════════════════════════════════════════════════════════
