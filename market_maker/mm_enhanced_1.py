@@ -33,6 +33,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from loguru import logger
 
 # ── Hyperliquid data feed for live signal data ──
 try:
@@ -40,6 +41,31 @@ try:
     HAS_HL_FEED = True
 except ImportError:
     HAS_HL_FEED = False
+
+# ── Binance BTC spot price feed ──
+try:
+    from binance_feed import BinanceBTCFeed
+    HAS_BINANCE_FEED = True
+except ImportError:
+    HAS_BINANCE_FEED = False
+
+# ── Polymarket Gamma API feed ──
+try:
+    from polymarket_gamma import PolymarketGammaFeed
+    HAS_GAMMA_FEED = True
+except ImportError:
+    HAS_GAMMA_FEED = False
+
+# ── Chainlink BTC/USD settlement feed ──
+try:
+    from chainlink_feed import ChainlinkBTCFeed
+    HAS_CHAINLINK_FEED = True
+except ImportError:
+    HAS_CHAINLINK_FEED = False
+
+# ── Confidence scoring + paper trading ──
+from confidence import ConfidenceCalculator
+from paper_trader import PaperTrader
 
 # ── Polymarket dynamic fee model ──
 from fees import (
@@ -113,6 +139,8 @@ class SideDataSnapshot:
 
     # Market microstructure
     market_spread: float = 0.0         # Current bid-ask spread on Polymarket
+    market_best_bid: float = 0.0       # Gamma top-of-book bid
+    market_best_ask: float = 1.0       # Gamma top-of-book ask
     seconds_to_expiry: float = 300.0
 
     timestamp: float = 0.0
@@ -353,12 +381,25 @@ class EnhancedQuoteEngine:
         #  GENERATE PRICES
         # ════════════════════════════════════════════════════
 
-        yes_bid = round(max(0.01, fair_value - half_spread - skew), 4)
-        yes_ask = round(min(0.99, fair_value + half_spread - skew), 4)
+        # Anchor quotes to the MARKET mid, not internal fair_value.
+        # Internal fair_value is used only as a directional lean (capped at ±2¢).
+        # This ensures our quotes are always competitive with the live order book.
+        if data.market_best_bid > 0 and data.market_best_ask < 1.0:
+            market_mid = (data.market_best_bid + data.market_best_ask) / 2
+        else:
+            market_mid = fair_value
+
+        # Directional lean: shift center toward fair_value, max ±2¢
+        fair_lean = max(-0.02, min(0.02, fair_value - market_mid))
+
+        center = market_mid + fair_lean
+
+        yes_bid = round(max(0.01, center - half_spread - skew), 4)
+        yes_ask = round(min(0.99, center + half_spread - skew), 4)
         if yes_bid >= yes_ask:
             yes_bid = round(yes_ask - 0.01, 4)
 
-        no_fair = 1.0 - fair_value
+        no_fair = 1.0 - center
         no_skew = -skew
         no_bid = round(max(0.01, no_fair - half_spread - no_skew), 4)
         no_ask = round(min(0.99, no_fair + half_spread - no_skew), 4)
@@ -996,8 +1037,8 @@ class HistoricalDataLoader:
         try:
             with open(self.recording_file, "a") as f:
                 f.write(json.dumps(asdict(snapshot)) + "\n")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to write signal snapshot to {self.recording_file}: {e}")
 
     def load_data(self, max_ticks: int = 50000) -> list[SideDataSnapshot]:
         """Load recorded historical ticks for backtesting."""
@@ -1058,48 +1099,79 @@ def run_backtest():
 
 async def run_signal_monitor():
     """
-    Live signal monitoring mode — connects to Hyperliquid and prints
-    real-time signals that would feed into the EnhancedQuoteEngine.
+    Live signal monitoring mode — connects to Hyperliquid, Binance, and
+    Polymarket Gamma API to print real-time signals feeding EnhancedQuoteEngine.
 
-    This lets you verify the data pipeline before trading with it.
-    Use: python mm_enhanced_1.py --signals
+    Use: python mm_enhanced1.py --signals
     """
     if not HAS_HL_FEED:
         print("ERROR: hyperliquid_api.py not found.")
         print("Make sure hyperliquid_api.py is in the same directory.")
         return
 
-    feed = HyperliquidFeed(poll_interval=3.0)
+    hl_feed = HyperliquidFeed(poll_interval=3.0)
     fair_value_engine = EnhancedFairValueEngine()
     quote_engine = EnhancedQuoteEngine()
     data_loader = HistoricalDataLoader()
 
+    # Optional feeds — degrade gracefully if files missing
+    btc_feed = BinanceBTCFeed() if HAS_BINANCE_FEED else None
+    gamma_feed = PolymarketGammaFeed() if HAS_GAMMA_FEED else None
+    chainlink_feed = ChainlinkBTCFeed() if HAS_CHAINLINK_FEED else None
+
     print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║  LIVE SIGNAL MONITOR                                         ║
-║  Connecting to Hyperliquid for real-time derivatives data...  ║
+║  Hyperliquid  +  Binance BTC  +  Chainlink  +  Gamma API     ║
 ║  Press Ctrl+C to stop                                        ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
 
-    await feed.start()
+    # Start all feeds concurrently
+    start_tasks = [hl_feed.start()]
+    if btc_feed:
+        start_tasks.append(btc_feed.start())
+    if gamma_feed:
+        start_tasks.append(gamma_feed.start())
+    if chainlink_feed:
+        start_tasks.append(chainlink_feed.start())
+    await asyncio.gather(*start_tasks)
 
-    # Wait a few seconds for initial data
+    if btc_feed:
+        print(f"  Binance BTC feed:  {'connected' if btc_feed.is_connected else 'connecting...'}")
+    else:
+        print("  Binance BTC feed:  NOT AVAILABLE (binance_feed.py missing)")
+    if chainlink_feed:
+        print(f"  Chainlink feed:    polling Polygon (settlement source)")
+    else:
+        print("  Chainlink feed:    NOT AVAILABLE (chainlink_feed.py missing)")
+    if gamma_feed:
+        print(f"  Polymarket Gamma:  polling active BTC markets")
+    else:
+        print("  Polymarket Gamma:  NOT AVAILABLE (polymarket_gamma.py missing)")
+
+    # Brief wait for WebSocket connections to settle
     await asyncio.sleep(5)
 
     try:
         cycle = 0
         while True:
-            hl_fields = feed.get_snapshot_fields()
+            hl_fields = hl_feed.get_snapshot_fields()
+            btc_fields = btc_feed.get_snapshot_fields() if btc_feed else {}
+            gamma_fields = gamma_feed.get_snapshot_fields() if gamma_feed else {}
+            cl_fields = chainlink_feed.get_snapshot_fields() if chainlink_feed else {}
 
-            # Build a SideDataSnapshot with Hyperliquid data
-            # BTC price fields would come from BTCPriceFeed in production;
-            # here we use the oracle price as a stand-in for monitoring.
+            # Wire Binance price into Chainlink feed for lead calculation
+            if chainlink_feed and btc_feed and btc_feed.price:
+                chainlink_feed.binance_price = btc_feed.price
+
             snapshot = SideDataSnapshot(
-                btc_price=hl_fields["hl_oracle_price"],
-                btc_change_1m=0.0,      # would come from BTCPriceFeed
-                btc_change_5m=0.0,      # would come from BTCPriceFeed
-                btc_volatility_1m=0.001, # would come from BTCPriceFeed
+                # BTC spot price — from Binance (real), fallback to HL oracle
+                btc_price=btc_fields.get("btc_price") or hl_fields["hl_oracle_price"],
+                btc_change_1m=btc_fields.get("btc_change_1m", 0.0),
+                btc_change_5m=btc_fields.get("btc_change_5m", 0.0),
+                btc_volatility_1m=btc_fields.get("btc_volatility_1m", 0.001),
+                # Hyperliquid derivatives signals
                 hl_oracle_price=hl_fields["hl_oracle_price"],
                 hl_funding_rate=hl_fields["hl_funding_rate"],
                 hl_open_interest=hl_fields["hl_open_interest"],
@@ -1107,28 +1179,58 @@ async def run_signal_monitor():
                 liq_signal=hl_fields["liq_signal"],
                 funding_signal=hl_fields["funding_signal"],
                 oi_signal=hl_fields["oi_signal"],
+                # Chainlink settlement price (Polygon on-chain)
+                chainlink_price=cl_fields.get("chainlink_price", 0.0),
+                # Polymarket market microstructure — from Gamma API
+                market_spread=gamma_fields.get("market_spread", 0.0),
+                seconds_to_expiry=gamma_fields.get("seconds_to_expiry", 300.0),
                 timestamp=time.time(),
             )
 
-            # Record for future backtesting
+            # Record tick for future backtesting
             data_loader.record_tick(snapshot)
 
-            # Show how the signals affect quoting
+            # Compute quotes
             fair_value = fair_value_engine.estimate(snapshot, market_yes_price=0.50)
             quotes = quote_engine.generate_quotes(fair_value, net_inventory=0.0, data=snapshot)
 
             cycle += 1
             if cycle % 2 == 0:  # Print every ~2 seconds
-                status = feed.status()
-                print(f"\n{'─'*60}")
-                print(f"  BTC Oracle: ${status['oracle_price']:,.2f}  |  Funding: {status['funding_rate']}/hr")
-                print(f"  OI: ${float(status['open_interest'].replace(',','')):,.0f}  |  WS Trades: {status['ws_trade_count']}")
-                print(f"  ┌─ Signals ─────────────────────────────────┐")
-                print(f"  │  CVD:      {status['cvd_signal']:>7s}  (buy vs sell flow)  │")
-                print(f"  │  Liq:      {status['liq_signal']:>7s}  (liquidation proxy) │")
-                print(f"  │  Funding:  {status['funding_signal']:>7s}  (crowd positioning) │")
-                print(f"  │  OI:       {status['oi_signal']:>7s}  (new money flow)    │")
-                print(f"  └────────────────────────────────────────────┘")
+                hl_status = hl_feed.status()
+                print(f"\n{'─'*65}")
+                # BTC price line — show Binance if available
+                if btc_feed and btc_feed.price:
+                    print(
+                        f"  BTC Binance:   ${btc_feed.price:,.2f} "
+                        f"({btc_feed.change_1m*100:+.3f}% 1m | {btc_feed.change_5m*100:+.3f}% 5m)"
+                    )
+                if chainlink_feed and chainlink_feed.price:
+                    lead = chainlink_feed.binance_lead
+                    lead_str = f"Binance lead: ${lead:+.2f}" if chainlink_feed.binance_price else "no Binance ref"
+                    print(
+                        f"  BTC Chainlink: ${chainlink_feed.price:,.2f}  ({lead_str})  "
+                        f"[settlement source — age {chainlink_feed.age:.0f}s]"
+                    )
+                print(
+                    f"  BTC Oracle:    ${hl_status['oracle_price']:,.2f}  |  "
+                    f"Funding: {hl_status['funding_rate']}/hr"
+                )
+                print(
+                    f"  OI: ${float(hl_status['open_interest'].replace(',','')):,.0f}  |  "
+                    f"WS Trades: {hl_status['ws_trade_count']}"
+                )
+                if gamma_feed:
+                    gstatus = gamma_feed.status()
+                    print(
+                        f"  Gamma Market: bid={gstatus['best_bid']}  ask={gstatus['best_ask']}  "
+                        f"spread={gstatus['spread']}  expiry={gstatus['seconds_to_expiry']}"
+                    )
+                print(f"  ┌─ Signals ──────────────────────────────────────┐")
+                print(f"  │  CVD:      {hl_status['cvd_signal']:>7s}  (buy vs sell flow)      │")
+                print(f"  │  Liq:      {hl_status['liq_signal']:>7s}  (liquidation pressure)  │")
+                print(f"  │  Funding:  {hl_status['funding_signal']:>7s}  (crowd positioning)    │")
+                print(f"  │  OI:       {hl_status['oi_signal']:>7s}  (new money flow)        │")
+                print(f"  └────────────────────────────────────────────────┘")
                 print(f"  Fair Value: {quotes['fair_value']:.4f}  |  Spread: {quotes['spread']:.4f}")
                 print(f"  YES Bid/Ask: {quotes['yes_bid']:.4f} / {quotes['yes_ask']:.4f}")
                 print(f"  Adjustments: {quotes['adjustments']}")
@@ -1138,8 +1240,196 @@ async def run_signal_monitor():
     except KeyboardInterrupt:
         print("\nStopping signal monitor...")
     finally:
-        await feed.stop()
+        stop_tasks = [hl_feed.stop()]
+        if btc_feed:
+            stop_tasks.append(btc_feed.stop())
+        if gamma_feed:
+            stop_tasks.append(gamma_feed.stop())
+        await asyncio.gather(*stop_tasks)
         print("Signal monitor stopped. Recorded ticks saved to data/mm_historical.jsonl")
+
+
+async def run_paper_trader():
+    """
+    Autonomous paper trading loop.
+
+    Connects all feeds, generates quotes every second, simulates fills
+    against live Polymarket prices, and writes state to
+    data/paper_mm_state.json for the dashboard to read.
+
+    Run the dashboard in a separate terminal:
+        venv/bin/python3 mm_dashboard.py
+      or:
+        venv/bin/python3 mm_dashboard.py --web
+    """
+    if not HAS_HL_FEED:
+        print("ERROR: hyperliquid_api.py not found.")
+        return
+
+    hl_feed = HyperliquidFeed(poll_interval=3.0)
+    btc_feed = BinanceBTCFeed() if HAS_BINANCE_FEED else None
+    gamma_feed = PolymarketGammaFeed() if HAS_GAMMA_FEED else None
+    chainlink_feed = ChainlinkBTCFeed() if HAS_CHAINLINK_FEED else None
+
+    fair_value_engine = EnhancedFairValueEngine()
+    quote_engine = EnhancedQuoteEngine()
+    data_loader = HistoricalDataLoader()
+    confidence_calc = ConfidenceCalculator(max_inventory=300.0)
+    trader = PaperTrader(starting_capital=1000.0, max_inventory=300.0)
+    trader.load()
+
+    print("""
+╔══════════════════════════════════════════════════════════════╗
+║  PAPER TRADER                                                ║
+║  Autonomous market making — no real funds at risk            ║
+║                                                              ║
+║  Dashboard (separate terminal):                              ║
+║    venv/bin/python3 mm_dashboard.py                          ║
+║    venv/bin/python3 mm_dashboard.py --web   (browser UI)     ║
+║                                                              ║
+║  Press Ctrl+C to stop and save state                         ║
+╚══════════════════════════════════════════════════════════════╝
+    """)
+
+    start_tasks = [hl_feed.start()]
+    if btc_feed:
+        start_tasks.append(btc_feed.start())
+    if gamma_feed:
+        start_tasks.append(gamma_feed.start())
+    if chainlink_feed:
+        start_tasks.append(chainlink_feed.start())
+    await asyncio.gather(*start_tasks)
+    await asyncio.sleep(5)  # Let feeds settle
+
+    logger.info("Paper trader started")
+
+    try:
+        cycle = 0
+        while True:
+            hl_fields = hl_feed.get_snapshot_fields()
+            btc_fields = btc_feed.get_snapshot_fields() if btc_feed else {}
+            gamma_fields = gamma_feed.get_snapshot_fields() if gamma_feed else {}
+            cl_fields = chainlink_feed.get_snapshot_fields() if chainlink_feed else {}
+
+            # Wire Binance price into Chainlink feed for lead calculation
+            if chainlink_feed and btc_feed and btc_feed.price:
+                chainlink_feed.binance_price = btc_feed.price
+
+            snapshot = SideDataSnapshot(
+                btc_price=btc_fields.get("btc_price") or hl_fields["hl_oracle_price"],
+                btc_change_1m=btc_fields.get("btc_change_1m", 0.0),
+                btc_change_5m=btc_fields.get("btc_change_5m", 0.0),
+                btc_volatility_1m=btc_fields.get("btc_volatility_1m", 0.001),
+                hl_oracle_price=hl_fields["hl_oracle_price"],
+                hl_funding_rate=hl_fields["hl_funding_rate"],
+                hl_open_interest=hl_fields["hl_open_interest"],
+                cvd_signal=hl_fields["cvd_signal"],
+                liq_signal=hl_fields["liq_signal"],
+                funding_signal=hl_fields["funding_signal"],
+                oi_signal=hl_fields["oi_signal"],
+                chainlink_price=cl_fields.get("chainlink_price", 0.0),
+                market_spread=gamma_fields.get("market_spread", 0.0),
+                market_best_bid=gamma_feed.best_bid if gamma_feed else 0.0,
+                market_best_ask=gamma_feed.best_ask if gamma_feed else 1.0,
+                seconds_to_expiry=gamma_fields.get("seconds_to_expiry", 300.0),
+                timestamp=time.time(),
+            )
+
+            # Build feed timestamps for freshness scoring
+            now = time.time()
+            feed_timestamps = {
+                "binance": now if (btc_feed and btc_feed.is_connected) else 0.0,
+                "hyperliquid": now if hl_feed.is_connected else 0.0,
+                "gamma": now if (gamma_feed and gamma_feed.is_fresh) else 0.0,
+                "chainlink": now if (chainlink_feed and chainlink_feed.is_fresh) else 0.0,
+            }
+
+            fair_value = fair_value_engine.estimate(snapshot, market_yes_price=0.50)
+            quotes = quote_engine.generate_quotes(
+                fair_value,
+                net_inventory=trader.state.net_inventory,
+                data=snapshot,
+            )
+
+            confidence = confidence_calc.score(
+                snapshot,
+                net_inventory=trader.state.net_inventory,
+                feed_timestamps=feed_timestamps,
+                market_yes_price=fair_value,
+            )
+
+            # Apply confidence multipliers to quotes
+            adjusted_quotes = dict(quotes)
+            adjusted_quotes["spread"] = quotes.get("spread", 0.02) * confidence.spread_multiplier
+
+            # Simulate fills
+            market_id = gamma_feed._condition_id or "" if gamma_feed else ""
+            fills = trader.process_cycle(adjusted_quotes, snapshot, confidence, market_id)
+
+            if fills:
+                for fill in fills:
+                    logger.info(f"FILL: {fill.side} {fill.size:.0f}sh @ {fill.price:.4f}")
+
+            # Write enriched state for dashboard
+            state_dict = {
+                **{k: v for k, v in trader.state.__dict__.items()
+                   if not k.startswith("_")},
+                # Add live signal fields for dashboard display
+                "btc_price": snapshot.btc_price,
+                "btc_change_1m": snapshot.btc_change_1m,
+                "btc_change_5m": snapshot.btc_change_5m,
+                "btc_volatility_1m": snapshot.btc_volatility_1m,
+                "cvd_signal": snapshot.cvd_signal,
+                "funding_signal": snapshot.funding_signal,
+                "liq_signal": snapshot.liq_signal,
+                "oi_signal": snapshot.oi_signal,
+                "confidence_tier": confidence.tier,
+                "confidence_reason": confidence.reason,
+                "confidence_signal_agreement": confidence.signal_agreement,
+                "confidence_data_freshness": confidence.data_freshness,
+                "confidence_spread_health": confidence.spread_health,
+                "confidence_inventory_neutral": confidence.inventory_neutral,
+            }
+            try:
+                from pathlib import Path as _Path
+                _Path("data").mkdir(exist_ok=True)
+                with open("data/paper_mm_state.json", "w") as f:
+                    json.dump(state_dict, f)
+            except Exception as e:
+                logger.warning(f"State write failed: {e}")
+
+            # Record tick for backtesting
+            data_loader.record_tick(snapshot)
+
+            cycle += 1
+            if cycle % 10 == 0:  # Console heartbeat every 10s
+                s = trader.state
+                logger.info(
+                    f"cycle={cycle} "
+                    f"pnl={s.realized_pnl:+.2f} "
+                    f"inv={s.net_inventory:+.0f} "
+                    f"conf={confidence.score:.0f}%[{confidence.tier}] "
+                    f"fills={s.total_fills} "
+                    f"trips={s.round_trips}"
+                )
+
+            await asyncio.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\nStopping paper trader...")
+    finally:
+        trader.save()
+        stop_tasks = [hl_feed.stop()]
+        if btc_feed:
+            stop_tasks.append(btc_feed.stop())
+        if gamma_feed:
+            stop_tasks.append(gamma_feed.stop())
+        if chainlink_feed:
+            stop_tasks.append(chainlink_feed.stop())
+        await asyncio.gather(*stop_tasks)
+        s = trader.state
+        print(f"\nFinal P&L: {s.realized_pnl:+.2f}  |  Fills: {s.total_fills}  |  Trips: {s.round_trips}")
+        print("State saved to data/paper_mm_state.json")
 
 
 def main():
@@ -1148,8 +1438,8 @@ def main():
                         help="Run parameter sweep backtester")
     parser.add_argument("--signals", action="store_true",
                         help="Run live signal monitor (connects to Hyperliquid)")
-    parser.add_argument("--mode", choices=["paper", "live"], default="paper",
-                        help="Trading mode (default: paper)")
+    parser.add_argument("--paper", action="store_true",
+                        help="Run autonomous paper trader with confidence scoring")
     parser.add_argument("--dual", action="store_true",
                         help="Run in dual-bot mode with position locking")
     args = parser.parse_args()
@@ -1158,6 +1448,8 @@ def main():
         run_backtest()
     elif args.signals:
         asyncio.run(run_signal_monitor())
+    elif args.paper:
+        asyncio.run(run_paper_trader())
     else:
         print("""
 ╔══════════════════════════════════════════════════════════════╗
@@ -1166,16 +1458,14 @@ def main():
 ║                                                              ║
 ║  Available modes:                                            ║
 ║                                                              ║
+║    --paper      Autonomous paper trader (confidence scoring) ║
+║    --signals    Live signal monitor only (no trading)        ║
 ║    --backtest   Run parameter sweep backtester               ║
-║    --signals    Live signal monitor (Hyperliquid data)        ║
 ║                                                              ║
-║  For actual trading, use market_maker.py with optimized      ║
-║  settings from the backtester.                               ║
+║  Dashboard (run in separate terminal):                       ║
+║    python mm_dashboard.py            Terminal UI (rich)      ║
+║    python mm_dashboard.py --web      Browser UI (port 8889)  ║
 ║                                                              ║
-║  Examples:                                                   ║
-║    python mm_enhanced_1.py --backtest                        ║
-║    python mm_enhanced_1.py --signals                         ║
-║    python market_maker.py --mode paper                       ║
 ╚══════════════════════════════════════════════════════════════╝
         """)
 
