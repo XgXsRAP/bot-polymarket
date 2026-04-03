@@ -26,8 +26,14 @@ import aiohttp
 from loguru import logger
 
 _CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-_RPC      = "https://1rpc.io/matic"
 _SELECTOR = "0x50d25bcd"   # keccak256("latestAnswer()")[:4]
+
+# Polygon RPC fallback chain — tried in order until one succeeds
+_RPC_ENDPOINTS = [
+    "https://polygon-rpc.com",       # Official Polygon Foundation RPC
+    "https://rpc.ankr.com/polygon",  # Ankr (generous free tier)
+    "https://1rpc.io/matic",         # 1RPC fallback
+]
 
 
 class ChainlinkBTCFeed:
@@ -75,40 +81,50 @@ class ChainlinkBTCFeed:
             await self._fetch()
 
     async def _fetch(self):
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": _CONTRACT, "data": _SELECTOR}, "latest"],
+            "id": 1,
+        }
+        result = await self._call_rpc(payload)
+        if not result or result == "0x":
+            return
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{"to": _CONTRACT, "data": _SELECTOR}, "latest"],
-                "id": 1,
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    _RPC,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    data = await resp.json()
-
-            result = data.get("result", "")
-            if result and result != "0x":
-                new_price = int(result, 16) / 1e8
-                # Sanity check: reject prices outside $1k–$500k range or >20% jump
-                if not (1_000 < new_price < 500_000):
-                    logger.debug(f"Chainlink: rejected out-of-range price ${new_price:,.2f}")
-                    return
-                if self._price > 0 and abs(new_price - self._price) / self._price > 0.20:
-                    logger.debug(f"Chainlink: rejected spike ${self._price:,.2f} → ${new_price:,.2f}")
-                    return
-                if new_price != self._price and self._price > 0:
-                    logger.debug(
-                        f"Chainlink BTC/USD updated: ${self._price:,.2f} → ${new_price:,.2f}"
-                    )
-                self._price = new_price
-                self._last_update = time.time()
-
+            new_price = int(result, 16) / 1e8
+            # Sanity check: reject prices outside $1k–$500k range or >20% jump
+            if not (1_000 < new_price < 500_000):
+                logger.debug(f"Chainlink: rejected out-of-range price ${new_price:,.2f}")
+                return
+            if self._price > 0 and abs(new_price - self._price) / self._price > 0.20:
+                logger.debug(f"Chainlink: rejected spike ${self._price:,.2f} → ${new_price:,.2f}")
+                return
+            if new_price != self._price and self._price > 0:
+                logger.debug(
+                    f"Chainlink BTC/USD updated: ${self._price:,.2f} → ${new_price:,.2f}"
+                )
+            self._price = new_price
+            self._last_update = time.time()
         except Exception as e:
-            logger.debug(f"Chainlink fetch error: {e}")
+            logger.debug(f"Chainlink price parse error: {e}")
+
+    async def _call_rpc(self, payload: dict) -> str:
+        """Try each RPC in the fallback chain; return hex result or empty string."""
+        for rpc_url in _RPC_ENDPOINTS:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        rpc_url,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                result = data.get("result", "")
+                if result and result != "0x":
+                    return result
+            except Exception as e:
+                logger.debug(f"Chainlink RPC {rpc_url} failed: {e}")
+        return ""
 
     # ── Public properties ─────────────────────────────────────────────────────
 
