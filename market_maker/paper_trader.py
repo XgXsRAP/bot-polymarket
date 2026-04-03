@@ -15,6 +15,7 @@ dashboard can read it without touching the trading loop.
 """
 
 import json
+import math
 import random
 import time
 from dataclasses import dataclass, field, asdict
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Optional
 
 from loguru import logger
+
+from fees import net_fill_fee
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -68,6 +71,8 @@ class PaperState:
     current_fair_value: float = 0.5
     current_confidence: float = 0.0
     current_spread: float = 0.0
+    market_best_bid: float = 0.0
+    market_best_ask: float = 1.0
 
     # Feed status
     last_update: float = 0.0
@@ -139,6 +144,41 @@ class PaperTrader:
         except Exception as e:
             logger.warning(f"Paper trader load error: {e}, starting fresh")
 
+    def reconcile_inventory(
+        self,
+        current_market_id: str | None,
+        current_seconds_to_expiry: float,
+    ) -> None:
+        """
+        Startup check: if the inventory loaded from disk belongs to a market
+        that has already expired (different condition_id or zero time left),
+        force-close it at the last known fair value so the session starts clean.
+
+        Call this after load() once the Gamma feed has warmed up.
+        """
+        if abs(self.state.net_inventory) < 0.01:
+            return  # nothing to reconcile
+
+        saved_mid = self.state.market_id
+        fv = self.state.current_fair_value or 0.5
+
+        market_changed = bool(
+            current_market_id and saved_mid and current_market_id != saved_mid
+        )
+        market_expired = current_seconds_to_expiry <= 0
+
+        if market_changed or market_expired:
+            reason = "market rolled over" if market_changed else "market already expired"
+            saved_label   = saved_mid[:16]          if saved_mid          else "none"
+            current_label = current_market_id[:16]  if current_market_id  else "none"
+            logger.warning(
+                f"Startup reconciliation: {reason} "
+                f"(saved={saved_label!r}, current={current_label!r}). "
+                f"Force-closing {self.state.net_inventory:+.0f}sh @ fair={fv:.4f}"
+            )
+            self._close_at_expiry(fv, saved_mid or "")
+            self.save()
+
     def save(self):
         """Persist state to disk for dashboard and recovery."""
         try:
@@ -185,22 +225,33 @@ class PaperTrader:
 
         quote_size = self.BASE_QUOTE_SIZE * confidence_result.size_multiplier
 
-        # Fill when our quote is competitive (at or better than top of book).
-        # This models being at the front of the queue:
-        #   - Our bid >= market best bid  → we're offering the best buy price
-        #   - Our ask <= market best ask  → we're offering the best sell price
-        # The 15% fill probability models that not every cycle has a matching order.
-        if our_bid >= market_best_bid and our_bid > 0:
-            if random.random() < self.FILL_PROBABILITY:
-                fill = self._fill_bid(our_bid, quote_size, market_id)
-                if fill:
-                    fills.append(fill)
+        # Fill probability for a resting maker order:
+        # A taker crosses our quote with probability that decays exponentially
+        # as our quote moves further from the market best bid/ask.
+        #
+        # At our_bid == market_best_bid → full FILL_PROBABILITY (front of queue)
+        # At our_bid 2¢ below best bid  → ~37% of FILL_PROBABILITY (behind queue)
+        # At our_bid 6¢ below best bid  → ~5% of FILL_PROBABILITY (deep in book)
+        #
+        # This is the correct model: market makers post OUTSIDE the spread and
+        # get filled when takers send orders deep enough to reach us.
+        _DECAY = 0.02   # ¢-scale decay constant (2¢ = 1/e of base probability)
 
-        if our_ask <= market_best_ask and our_ask < 1.0:
-            if random.random() < self.FILL_PROBABILITY:
-                fill = self._fill_ask(our_ask, quote_size, market_id)
-                if fill:
-                    fills.append(fill)
+        bid_depth = max(0.0, market_best_bid - our_bid)
+        bid_prob = self.FILL_PROBABILITY * math.exp(-bid_depth / _DECAY)
+        bid_filled = False
+        if our_bid > 0 and random.random() < bid_prob:
+            fill = self._fill_bid(our_bid, quote_size, market_id)
+            if fill:
+                fills.append(fill)
+                bid_filled = True
+
+        ask_depth = max(0.0, our_ask - market_best_ask)
+        ask_prob = self.FILL_PROBABILITY * math.exp(-ask_depth / _DECAY)
+        if not bid_filled and our_ask < 1.0 and random.random() < ask_prob:
+            fill = self._fill_ask(our_ask, quote_size, market_id)
+            if fill:
+                fills.append(fill)
 
         # Check for expiry: if market is expiring, close position
         if snapshot.seconds_to_expiry < 15 and abs(self.state.net_inventory) > 0:
@@ -222,18 +273,27 @@ class PaperTrader:
             return None  # Would exceed inventory limit
 
         # Update inventory and cash
+        pnl = 0.0
         if self.state.net_inventory >= 0:
             # Adding to long position — update average entry
             total_cost = self.state.avg_entry_price * self.state.net_inventory + cost
             self.state.net_inventory += size
             self.state.avg_entry_price = total_cost / self.state.net_inventory
         else:
-            # Closing a short position
+            # Closing a short position — record P&L
+            short_size = min(size, abs(self.state.net_inventory))
+            if short_size > 0:
+                pnl = (self.state.avg_entry_price - price) * short_size
+                self._record_round_trip(pnl)
+                self.state.realized_pnl += pnl
             self.state.net_inventory += size
             if self.state.net_inventory >= 0:
                 self.state.avg_entry_price = price
 
         self.state.cash -= cost
+        fee = net_fill_fee(price, size, is_maker=True)
+        self.state.cash -= fee
+        self.state.realized_pnl -= fee
         self.state.total_fills += 1
 
         fill = Fill(
@@ -241,11 +301,11 @@ class PaperTrader:
             side="buy_yes",
             price=price,
             size=size,
-            pnl=0.0,
+            pnl=pnl,
             market_id=market_id,
         )
         self._record_fill(fill)
-        logger.info(f"FILL BUY YES  {size:.0f}sh @ {price:.4f}  inv={self.state.net_inventory:+.0f}")
+        logger.info(f"FILL BUY YES  {size:.0f}sh @ {price:.4f}  pnl={pnl:+.4f}  inv={self.state.net_inventory:+.0f}")
         return fill
 
     def _fill_ask(self, price: float, size: float, market_id: str) -> Optional[Fill]:
@@ -266,6 +326,9 @@ class PaperTrader:
 
         self.state.net_inventory -= size
         self.state.cash += proceeds
+        fee = net_fill_fee(price, size, is_maker=True)
+        self.state.cash -= fee
+        self.state.realized_pnl -= fee
         self.state.total_fills += 1
 
         if self.state.net_inventory <= 0:
@@ -291,8 +354,11 @@ class PaperTrader:
         pnl = (resolution_price - self.state.avg_entry_price) * inv
         self.state.realized_pnl += pnl
         self.state.cash += resolution_price * abs(inv)
-        self._record_round_trip(pnl)
-        logger.info(f"EXPIRY CLOSE  {inv:+.0f}sh @ {resolution_price:.4f}  pnl={pnl:+.4f}")
+        fee = net_fill_fee(resolution_price, abs(inv), is_maker=False)
+        self.state.cash -= fee
+        self.state.realized_pnl -= fee
+        self._record_round_trip(pnl - fee)
+        logger.info(f"EXPIRY CLOSE  {inv:+.0f}sh @ {resolution_price:.4f}  pnl={pnl:+.4f}  fee={fee:+.4f}")
         self.state.net_inventory = 0.0
         self.state.avg_entry_price = 0.0
 
@@ -327,6 +393,12 @@ class PaperTrader:
         self.state.recent_fills.append(fill_dict)
         if len(self.state.recent_fills) > 100:
             self.state.recent_fills = self.state.recent_fills[-100:]
+        try:
+            Path(self.fills_file).parent.mkdir(exist_ok=True)
+            with open(self.fills_file, "a") as f:
+                f.write(json.dumps(fill_dict) + "\n")
+        except Exception as e:
+            logger.warning(f"Fill log write error: {e}")
 
     def _update_display(self, quotes, snapshot, confidence_result, market_id):
         self.state.current_yes_bid = quotes.get("yes_bid", 0.0)
@@ -334,6 +406,8 @@ class PaperTrader:
         self.state.current_fair_value = quotes.get("fair_value", 0.5)
         self.state.current_spread = quotes.get("spread", 0.0)
         self.state.current_confidence = confidence_result.score
+        self.state.market_best_bid = snapshot.market_best_bid
+        self.state.market_best_ask = snapshot.market_best_ask
         self.state.seconds_to_expiry = snapshot.seconds_to_expiry
         self.state.market_id = market_id
         self.state.last_update = time.time()
