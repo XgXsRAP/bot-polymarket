@@ -1,22 +1,22 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  ENHANCED MARKET MAKER — Side Data + Backtester                  ║
+║  POLYMARKET MARKET MAKER                                         ║
 ║                                                                  ║
-║  This module adds two things to market_maker.py:                 ║
+║  Autonomous market-making bot for BTC 5-minute UP/DOWN markets.  ║
+║  Quotes two-sided limit orders using real-time side data from    ║
+║  Hyperliquid (CVD, funding, OI, liquidations) and Chainlink      ║
+║  on-chain BTC price as the settlement reference.                 ║
 ║                                                                  ║
-║  1. SIDE DATA INTEGRATION                                        ║
-║     Uses CVD, liquidations, funding rate, and OI to dynamically  ║
-║     adjust spread width, inventory skew, and quote sizes.        ║
-║     This is NOT the same as directional trading — the side data  ║
-║     tells us HOW RISKY it is to quote, not WHICH SIDE to bet on. ║
+║  Side data adjusts spread width, inventory skew, and quote size  ║
+║  dynamically — NOT directional signals. The bot earns maker      ║
+║  rebates rather than paying taker fees.                          ║
 ║                                                                  ║
-║  2. BACKTESTER                                                   ║
-║     Replays historical Polymarket + BTC data to simulate how the ║
-║     market maker would have performed with different parameters.  ║
-║     This is how you PROVE the strategy works before risking money.║
-║                                                                  ║
-║  Run backtester:  python mm_enhanced.py --backtest               ║
-║  Run live paper:  python mm_enhanced.py --mode paper             ║
+║  Modes:                                                          ║
+║    python mm_enhanced1.py --paper      Paper trading (no funds)  ║
+║    python mm_enhanced1.py --live       Live CLOB orders          ║
+║    python mm_enhanced1.py --dual       Live + position lock      ║
+║    python mm_enhanced1.py --signals    Signal monitor only       ║
+║    python mm_enhanced1.py --backtest   Parameter sweep           ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -34,6 +34,12 @@ from typing import Optional
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from loguru import logger
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv optional; env vars can still be set externally
 
 # ── Hyperliquid data feed for live signal data ──
 try:
@@ -66,6 +72,16 @@ except ImportError:
 # ── Confidence scoring + paper trading ──
 from confidence import ConfidenceCalculator
 from paper_trader import PaperTrader
+
+# ── Live CLOB order manager (optional — requires py-clob-client) ──
+try:
+    from live_order_manager import LiveOrderManager
+    HAS_LIVE_TRADER = True
+except ImportError:
+    HAS_LIVE_TRADER = False
+
+# ── Alerting (Telegram / Discord) ──
+from alerting import AlertManager
 
 # ── Polymarket dynamic fee model ──
 from fees import (
@@ -1274,8 +1290,12 @@ async def run_paper_trader():
     fair_value_engine = EnhancedFairValueEngine()
     quote_engine = EnhancedQuoteEngine()
     data_loader = HistoricalDataLoader()
-    confidence_calc = ConfidenceCalculator(max_inventory=300.0)
-    trader = PaperTrader(starting_capital=1000.0, max_inventory=300.0)
+    confidence_calc = ConfidenceCalculator(max_inventory=30.0)
+    alerter = AlertManager.from_env()
+    if alerter.enabled:
+        logger.info("AlertManager: Telegram/Discord alerting active")
+
+    trader = PaperTrader(starting_capital=100.0, max_inventory=30.0)
     trader.load()
 
     print("""
@@ -1301,10 +1321,27 @@ async def run_paper_trader():
     await asyncio.gather(*start_tasks)
     await asyncio.sleep(5)  # Let feeds settle
 
+    # Reconcile any inventory loaded from disk against the live market
+    if gamma_feed:
+        trader.reconcile_inventory(
+            gamma_feed._condition_id,
+            gamma_feed.seconds_to_expiry,
+        )
+
     logger.info("Paper trader started")
+
+    if alerter.enabled:
+        await alerter.send(
+            f"🟢 <b>Paper trader started</b>\n"
+            f"Capital: ${trader.state.starting_capital:.2f}  "
+            f"Loaded PnL: {trader.state.realized_pnl:+.2f}"
+        )
 
     try:
         cycle = 0
+        _last_save = time.time()
+        _last_summary = time.time()
+        _SUMMARY_INTERVAL = 1800  # 30-min P&L digest
         while True:
             hl_fields = hl_feed.get_snapshot_fields()
             btc_fields = btc_feed.get_snapshot_fields() if btc_feed else {}
@@ -1341,10 +1378,17 @@ async def run_paper_trader():
                 "binance": now if (btc_feed and btc_feed.is_connected) else 0.0,
                 "hyperliquid": now if hl_feed.is_connected else 0.0,
                 "gamma": now if (gamma_feed and gamma_feed.is_fresh) else 0.0,
-                "chainlink": now if (chainlink_feed and chainlink_feed.is_fresh) else 0.0,
+                "chainlink": (chainlink_feed._last_update if chainlink_feed else 0.0),
             }
 
-            fair_value = fair_value_engine.estimate(snapshot, market_yes_price=0.50)
+            # Use actual live market mid as the price anchor — NOT hardcoded 0.50.
+            # The fair value engine blends 60% market weight, so feeding the real
+            # mid price is critical for quotes to track where the market actually is.
+            if snapshot.market_best_bid > 0 and snapshot.market_best_ask < 1.0:
+                actual_market_mid = (snapshot.market_best_bid + snapshot.market_best_ask) / 2
+            else:
+                actual_market_mid = 0.50
+            fair_value = fair_value_engine.estimate(snapshot, market_yes_price=actual_market_mid)
             quotes = quote_engine.generate_quotes(
                 fair_value,
                 net_inventory=trader.state.net_inventory,
@@ -1356,11 +1400,18 @@ async def run_paper_trader():
                 net_inventory=trader.state.net_inventory,
                 feed_timestamps=feed_timestamps,
                 market_yes_price=fair_value,
+                consecutive_losses=trader.state.consecutive_losses,
             )
 
-            # Apply confidence multipliers to quotes
+            # Apply confidence spread multiplier: widen bid/ask prices outward
+            # from the center so the actual quoted prices reflect the wider spread.
             adjusted_quotes = dict(quotes)
-            adjusted_quotes["spread"] = quotes.get("spread", 0.02) * confidence.spread_multiplier
+            orig_spread = quotes.get("spread", 0.02)
+            new_spread = orig_spread * confidence.spread_multiplier
+            extra_half = (new_spread - orig_spread) / 2
+            adjusted_quotes["spread"] = new_spread
+            adjusted_quotes["yes_bid"] = round(max(0.01, quotes["yes_bid"] - extra_half), 4)
+            adjusted_quotes["yes_ask"] = round(min(0.99, quotes["yes_ask"] + extra_half), 4)
 
             # Simulate fills
             market_id = gamma_feed._condition_id or "" if gamma_feed else ""
@@ -1369,6 +1420,94 @@ async def run_paper_trader():
             if fills:
                 for fill in fills:
                     logger.info(f"FILL: {fill.side} {fill.size:.0f}sh @ {fill.price:.4f}")
+                    if alerter.enabled:
+                        side_label = fill.side.replace("_", " ").upper()
+                        emoji = "🟢" if fill.side == "buy_yes" else "🔴"
+                        message = (
+                            f"{emoji} <b>Paper fill</b> {side_label}\n"
+                            f"Size: {fill.size:.0f}sh  Price: {fill.price*100:.1f}c\n"
+                            f"Inventory: {trader.state.net_inventory:+.0f}sh  "
+                            f"Total fills: {trader.state.total_fills}"
+                        )
+                        if fill.pnl != 0:
+                            trip_emoji = "✅" if fill.pnl > 0 else "❌"
+                            message += (
+                                f"\n{trip_emoji} Closed PnL: {fill.pnl:+.4f}  "
+                                f"Total: {trader.state.realized_pnl:+.2f}\n"
+                                f"Trips: {trader.state.round_trips}  Win: "
+                                f"{trader.state.winning_trips/max(1,trader.state.round_trips)*100:.0f}%"
+                            )
+                        await alerter.send(
+                            message,
+                        )
+
+            # Persist state after every fill, and at least every 30s (crash safety)
+            _now = time.time()
+            if fills or (_now - _last_save >= 30):
+                trader.save()
+                _last_save = _now
+
+            # ── Alert checks ─────────────────────────────────────────────────
+            if alerter.enabled:
+                # Circuit breaker: confidence PAUSED due to loss streak
+                if confidence.tier == "PAUSED" and trader.state.consecutive_losses >= 5:
+                    await alerter.send(
+                        f"⚠️ <b>CIRCUIT BREAKER</b>\n"
+                        f"Confidence PAUSED after {trader.state.consecutive_losses} "
+                        f"consecutive losses.\n"
+                        f"PnL: {trader.state.realized_pnl:+.2f}  "
+                        f"Drawdown: {trader.state.max_drawdown:.2f}",
+                        key="circuit_breaker",
+                        cooldown=600,
+                    )
+                # Drawdown threshold (5% of starting capital)
+                _dd_threshold = trader.state.starting_capital * 0.05
+                if trader.state.max_drawdown >= _dd_threshold:
+                    await alerter.send(
+                        f"⚠️ <b>DRAWDOWN ALERT</b>\n"
+                        f"Max drawdown ${trader.state.max_drawdown:.2f} exceeded "
+                        f"${_dd_threshold:.2f} threshold.\n"
+                        f"Cash: ${trader.state.cash:.2f}  "
+                        f"PnL: {trader.state.realized_pnl:+.2f}",
+                        key="drawdown",
+                        cooldown=1800,
+                    )
+                # Chainlink stale
+                if chainlink_feed and chainlink_feed.age > 120:
+                    await alerter.send(
+                        f"⚠️ <b>CHAINLINK STALE</b>\n"
+                        f"No Chainlink update for {chainlink_feed.age:.0f}s "
+                        f"(settlement source!).\nLast price: "
+                        f"${chainlink_feed.price:,.2f}",
+                        key="chainlink_stale",
+                        cooldown=600,
+                    )
+                # Gamma API cannot find a market
+                if gamma_feed and gamma_feed._slug_miss_count >= 3:
+                    await alerter.send(
+                        f"⚠️ <b>GAMMA MARKET NOT FOUND</b>\n"
+                        f"{gamma_feed._slug_miss_count} consecutive window misses.\n"
+                        f"Last slug: {gamma_feed._last_slug or 'none'}\n"
+                        f"Bot is running without live Polymarket bid/ask.",
+                        key="gamma_miss",
+                        cooldown=600,
+                    )
+                # 30-min P&L digest
+                if _now - _last_summary >= _SUMMARY_INTERVAL:
+                    _last_summary = _now
+                    wr = (trader.state.winning_trips /
+                          max(1, trader.state.round_trips) * 100)
+                    await alerter.send(
+                        f"📊 <b>30-min digest</b>\n"
+                        f"PnL: {trader.state.realized_pnl:+.2f}  "
+                        f"Cash: ${trader.state.cash:.2f}\n"
+                        f"Fills: {trader.state.total_fills}  "
+                        f"Trips: {trader.state.round_trips}  Win: {wr:.0f}%\n"
+                        f"Inventory: {trader.state.net_inventory:+.0f}sh  "
+                        f"MaxDD: ${trader.state.max_drawdown:.2f}",
+                        key="summary",
+                    )
+            # ── End alert checks ──────────────────────────────────────────────
 
             # Write enriched state for dashboard
             state_dict = {
@@ -1391,9 +1530,9 @@ async def run_paper_trader():
                 "confidence_inventory_neutral": confidence.inventory_neutral,
             }
             try:
-                from pathlib import Path as _Path
-                _Path("data").mkdir(exist_ok=True)
-                with open("data/paper_mm_state.json", "w") as f:
+                _state_path = Path(__file__).resolve().parent / "data" / "paper_mm_state.json"
+                _state_path.parent.mkdir(exist_ok=True)
+                with open(_state_path, "w") as f:
                     json.dump(state_dict, f)
             except Exception as e:
                 logger.warning(f"State write failed: {e}")
@@ -1432,6 +1571,298 @@ async def run_paper_trader():
         print("State saved to data/paper_mm_state.json")
 
 
+async def run_live_trader(dual: bool = False):
+    """
+    Autonomous live trading loop — posts real limit orders to Polymarket's CLOB.
+
+    Mirrors run_paper_trader() structurally.  The only differences are:
+      - Uses LiveOrderManager instead of PaperTrader
+      - Reads CLOB credentials from environment
+      - SharedPositionLock is activated when dual=True
+      - cancel_all() is called on exit so no orphaned orders remain
+
+    WARNING: This uses real funds on Polygon Mainnet.
+    """
+    if not HAS_LIVE_TRADER:
+        print("ERROR: live_order_manager.py not found or py-clob-client not installed.")
+        print("       pip install py-clob-client eth-account websockets")
+        return
+
+    if not HAS_HL_FEED:
+        print("ERROR: hyperliquid_api.py not found.")
+        return
+
+    private_key   = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    api_key       = os.environ.get("POLYMARKET_API_KEY", "")
+    api_secret    = os.environ.get("POLYMARKET_API_SECRET", "")
+    api_passphrase = os.environ.get("POLYMARKET_API_PASSPHRASE", "")
+
+    missing = [k for k, v in {
+        "POLYMARKET_PRIVATE_KEY": private_key,
+        "POLYMARKET_API_KEY": api_key,
+        "POLYMARKET_API_SECRET": api_secret,
+        "POLYMARKET_API_PASSPHRASE": api_passphrase,
+    }.items() if not v]
+    if missing:
+        print(f"ERROR: missing env vars: {', '.join(missing)}")
+        print("       Set them in your .env file and re-run.")
+        return
+
+    hl_feed       = HyperliquidFeed(poll_interval=3.0)
+    btc_feed      = BinanceBTCFeed()      if HAS_BINANCE_FEED   else None
+    gamma_feed    = PolymarketGammaFeed() if HAS_GAMMA_FEED     else None
+    chainlink_feed = ChainlinkBTCFeed()  if HAS_CHAINLINK_FEED  else None
+
+    fair_value_engine = EnhancedFairValueEngine()
+    quote_engine      = EnhancedQuoteEngine()
+    data_loader       = HistoricalDataLoader()
+    confidence_calc   = ConfidenceCalculator(max_inventory=300.0)
+
+    position_lock = SharedPositionLock() if dual else None
+
+    alerter = AlertManager.from_env()
+    if alerter.enabled:
+        logger.info("AlertManager: Telegram/Discord alerting active")
+
+    manager = LiveOrderManager(private_key, api_key, api_secret, api_passphrase)
+
+    print("""
+\033[31m╔══════════════════════════════════════════════════════════════╗
+║  LIVE TRADER — REAL FUNDS ON POLYGON MAINNET                 ║
+║  Orders are posted to clob.polymarket.com                    ║
+║                                                              ║
+║  Press Ctrl+C to stop (open orders will be cancelled)        ║
+╚══════════════════════════════════════════════════════════════╝\033[0m
+    """)
+    if dual:
+        print("  Dual mode: SharedPositionLock active\n")
+
+    start_tasks = [hl_feed.start()]
+    if btc_feed:
+        start_tasks.append(btc_feed.start())
+    if gamma_feed:
+        start_tasks.append(gamma_feed.start())
+    if chainlink_feed:
+        start_tasks.append(chainlink_feed.start())
+    await asyncio.gather(*start_tasks)
+    await asyncio.sleep(5)  # Let feeds settle
+
+    await manager.start()
+    logger.info("Live trader started")
+
+    # Simple inventory / P&L tracking (fills come from LiveOrderManager)
+    total_fills = 0
+    realized_pnl = 0.0
+    net_inventory = 0.0
+    consecutive_losses = 0
+    max_live_inventory = confidence_calc.max_inventory
+    max_live_loss = float(os.environ.get("MAX_LIVE_LOSS", "50.0"))
+
+    try:
+        cycle = 0
+        while True:
+            hl_fields    = hl_feed.get_snapshot_fields()
+            btc_fields   = btc_feed.get_snapshot_fields()   if btc_feed        else {}
+            gamma_fields = gamma_feed.get_snapshot_fields() if gamma_feed      else {}
+            cl_fields    = chainlink_feed.get_snapshot_fields() if chainlink_feed else {}
+
+            if chainlink_feed and btc_feed and btc_feed.price:
+                chainlink_feed.binance_price = btc_feed.price
+
+            snapshot = SideDataSnapshot(
+                btc_price=btc_fields.get("btc_price") or hl_fields["hl_oracle_price"],
+                btc_change_1m=btc_fields.get("btc_change_1m", 0.0),
+                btc_change_5m=btc_fields.get("btc_change_5m", 0.0),
+                btc_volatility_1m=btc_fields.get("btc_volatility_1m", 0.001),
+                hl_oracle_price=hl_fields["hl_oracle_price"],
+                hl_funding_rate=hl_fields["hl_funding_rate"],
+                hl_open_interest=hl_fields["hl_open_interest"],
+                cvd_signal=hl_fields["cvd_signal"],
+                liq_signal=hl_fields["liq_signal"],
+                funding_signal=hl_fields["funding_signal"],
+                oi_signal=hl_fields["oi_signal"],
+                chainlink_price=cl_fields.get("chainlink_price", 0.0),
+                market_spread=gamma_fields.get("market_spread", 0.0),
+                market_best_bid=gamma_feed.best_bid if gamma_feed else 0.0,
+                market_best_ask=gamma_feed.best_ask if gamma_feed else 1.0,
+                seconds_to_expiry=gamma_fields.get("seconds_to_expiry", 300.0),
+                timestamp=time.time(),
+            )
+
+            now = time.time()
+            feed_timestamps = {
+                "binance":     now if (btc_feed and btc_feed.is_connected)               else 0.0,
+                "hyperliquid": now if hl_feed.is_connected                               else 0.0,
+                "gamma":       now if (gamma_feed and gamma_feed.is_fresh)               else 0.0,
+                "chainlink":   (chainlink_feed._last_update if chainlink_feed else 0.0),
+            }
+
+            fair_value = fair_value_engine.estimate(snapshot, market_yes_price=0.50)
+            quotes = quote_engine.generate_quotes(
+                fair_value,
+                net_inventory=net_inventory,
+                data=snapshot,
+            )
+
+            confidence = confidence_calc.score(
+                snapshot,
+                net_inventory=net_inventory,
+                feed_timestamps=feed_timestamps,
+                market_yes_price=fair_value,
+                consecutive_losses=consecutive_losses,
+            )
+
+            adjusted_quotes = dict(quotes)
+            adjusted_quotes["spread"] = quotes.get("spread", 0.02) * confidence.spread_multiplier
+
+            yes_token_id = gamma_feed.yes_token_id if gamma_feed else None
+            market_id    = gamma_feed._condition_id or "" if gamma_feed else ""
+
+            # Hard position limit: halt quoting when inventory is maxed
+            skip = False
+            if abs(net_inventory) >= max_live_inventory:
+                logger.warning(
+                    f"Hard position limit: inv={net_inventory:+.0f} >= {max_live_inventory:.0f}, "
+                    f"cancelling quotes this cycle"
+                )
+                skip = True
+
+            # Dual mode: skip if the position lock is held by the directional bot
+            if not skip and position_lock and not position_lock.acquire_mm(market_id):
+                skip = True
+
+            if skip:
+                fills = []
+            else:
+                fills = await manager.process_cycle(
+                    adjusted_quotes, snapshot, confidence, market_id, yes_token_id
+                )
+                if position_lock:
+                    position_lock.release_mm(market_id)
+
+            for fill in fills:
+                total_fills += 1
+                if fill.pnl < 0:
+                    consecutive_losses += 1
+                elif fill.pnl > 0:
+                    consecutive_losses = 0
+                if fill.side == "sell_yes":
+                    realized_pnl += fill.pnl
+                    net_inventory -= fill.size
+                else:
+                    net_inventory += fill.size
+                logger.info(
+                    f"LIVE FILL: {fill.side} {fill.size:.0f}sh @ {fill.price:.4f} "
+                    f"pnl={fill.pnl:+.4f}"
+                )
+
+            # Drawdown circuit breaker: stop if session loss exceeds limit
+            if realized_pnl < -max_live_loss:
+                logger.error(
+                    f"CIRCUIT BREAKER: session loss {realized_pnl:+.2f} exceeds "
+                    f"-{max_live_loss:.2f} limit. Cancelling all orders and stopping."
+                )
+                await alerter.send(
+                    f"🚨 <b>LIVE CIRCUIT BREAKER FIRED</b>\n"
+                    f"Session loss <b>{realized_pnl:+.2f}</b> exceeded "
+                    f"-{max_live_loss:.2f} limit.\n"
+                    f"All orders cancelled. Bot stopped.",
+                    key="live_circuit_breaker",
+                )
+                break
+
+            # ── Alert checks (live) ───────────────────────────────────────────
+            if alerter.enabled:
+                # Chainlink stale
+                if chainlink_feed and chainlink_feed.age > 120:
+                    await alerter.send(
+                        f"⚠️ <b>CHAINLINK STALE (LIVE)</b>\n"
+                        f"No Chainlink update for {chainlink_feed.age:.0f}s "
+                        f"(settlement source!).\nLast price: "
+                        f"${chainlink_feed.price:,.2f}",
+                        key="live_chainlink_stale",
+                        cooldown=600,
+                    )
+                # Gamma API cannot find a market
+                if gamma_feed and gamma_feed._slug_miss_count >= 3:
+                    await alerter.send(
+                        f"⚠️ <b>GAMMA MARKET NOT FOUND (LIVE)</b>\n"
+                        f"{gamma_feed._slug_miss_count} consecutive window misses.\n"
+                        f"Last slug: {gamma_feed._last_slug or 'none'}\n"
+                        f"Bot is running without live Polymarket bid/ask.",
+                        key="live_gamma_miss",
+                        cooldown=600,
+                    )
+            # ── End alert checks ──────────────────────────────────────────────
+
+            # Write state for dashboard
+            state_dict = {
+                "mode": "live",
+                "dual": dual,
+                "btc_price": snapshot.btc_price,
+                "btc_change_1m": snapshot.btc_change_1m,
+                "btc_change_5m": snapshot.btc_change_5m,
+                "btc_volatility_1m": snapshot.btc_volatility_1m,
+                "cvd_signal": snapshot.cvd_signal,
+                "funding_signal": snapshot.funding_signal,
+                "liq_signal": snapshot.liq_signal,
+                "oi_signal": snapshot.oi_signal,
+                "yes_bid": adjusted_quotes.get("yes_bid", 0.0),
+                "yes_ask": adjusted_quotes.get("yes_ask", 1.0),
+                "fair_value": fair_value,
+                "spread": adjusted_quotes.get("spread", 0.0),
+                "confidence_tier": confidence.tier,
+                "confidence_score": confidence.score,
+                "confidence_reason": confidence.reason,
+                "net_inventory": net_inventory,
+                "realized_pnl": realized_pnl,
+                "total_fills": total_fills,
+                "market_id": market_id,
+                "yes_token_id": yes_token_id or "",
+                "seconds_to_expiry": snapshot.seconds_to_expiry,
+                "ws_connected": manager.is_connected,
+                "open_quotes": manager.status()["open_quotes"],
+                "last_update": now,
+            }
+            try:
+                _state_path = Path(__file__).resolve().parent / "data" / "live_mm_state.json"
+                _state_path.parent.mkdir(exist_ok=True)
+                with open(_state_path, "w") as f:
+                    json.dump(state_dict, f)
+            except Exception as e:
+                logger.warning(f"State write failed: {e}")
+
+            data_loader.record_tick(snapshot)
+
+            cycle += 1
+            if cycle % 10 == 0:
+                logger.info(
+                    f"cycle={cycle} "
+                    f"pnl={realized_pnl:+.4f} "
+                    f"inv={net_inventory:+.0f} "
+                    f"conf={confidence.score:.0f}%[{confidence.tier}] "
+                    f"fills={total_fills} "
+                    f"ws={'✓' if manager.is_connected else '✗'}"
+                )
+
+            await asyncio.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\nStopping live trader...")
+    finally:
+        await manager.stop()
+        stop_tasks = [hl_feed.stop()]
+        if btc_feed:
+            stop_tasks.append(btc_feed.stop())
+        if gamma_feed:
+            stop_tasks.append(gamma_feed.stop())
+        if chainlink_feed:
+            stop_tasks.append(chainlink_feed.stop())
+        await asyncio.gather(*stop_tasks)
+        print(f"\nFinal P&L: {realized_pnl:+.4f}  |  Fills: {total_fills}")
+        print("Open orders cancelled. State saved to data/live_mm_state.json")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Market Maker + Backtester")
     parser.add_argument("--backtest", action="store_true",
@@ -1440,16 +1871,23 @@ def main():
                         help="Run live signal monitor (connects to Hyperliquid)")
     parser.add_argument("--paper", action="store_true",
                         help="Run autonomous paper trader with confidence scoring")
+    parser.add_argument("--live", action="store_true",
+                        help="Live trading via Polymarket CLOB (real funds on Polygon)")
     parser.add_argument("--dual", action="store_true",
-                        help="Run in dual-bot mode with position locking")
+                        help="Live trading with SharedPositionLock (MM + directional co-exist)")
     args = parser.parse_args()
 
     if args.backtest:
-        run_backtest()
+        from backtests.backtest_unified import run_unified_backtest
+        run_unified_backtest()
     elif args.signals:
         asyncio.run(run_signal_monitor())
     elif args.paper:
         asyncio.run(run_paper_trader())
+    elif args.live:
+        asyncio.run(run_live_trader(dual=False))
+    elif args.dual:
+        asyncio.run(run_live_trader(dual=True))
     else:
         print("""
 ╔══════════════════════════════════════════════════════════════╗
@@ -1458,9 +1896,11 @@ def main():
 ║                                                              ║
 ║  Available modes:                                            ║
 ║                                                              ║
-║    --paper      Autonomous paper trader (confidence scoring) ║
-║    --signals    Live signal monitor only (no trading)        ║
-║    --backtest   Run parameter sweep backtester               ║
+║    --paper      Paper trader — no real funds                 ║
+║    --live       Live trading via CLOB (REAL FUNDS)           ║
+║    --dual       Live trading + SharedPositionLock            ║
+║    --signals    Signal monitor only (no trading)             ║
+║    --backtest   Parameter sweep backtester                   ║
 ║                                                              ║
 ║  Dashboard (run in separate terminal):                       ║
 ║    python mm_dashboard.py            Terminal UI (rich)      ║
