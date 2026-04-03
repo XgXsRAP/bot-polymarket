@@ -15,11 +15,18 @@ Provides:
 """
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 
 import aiohttp
 from loguru import logger
+
+try:
+    import websockets
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
 
 _GAMMA_BASE = "https://gamma-api.polymarket.com"
 _WINDOW = 300  # 5-minute markets
@@ -40,13 +47,21 @@ def _current_slug(offset: int = 0) -> str:
 
 class PolymarketGammaFeed:
     """
-    Polls the Polymarket Gamma API using deterministic slugs.
+    Polls the Polymarket Gamma API using deterministic slugs, and supplements
+    bid/ask with a CLOB WebSocket subscription for sub-second book updates.
 
-    Polls every 10 seconds. On each poll:
+    Polls every 10 seconds (REST). On each poll:
       1. Calculate slug for the current 5-min window
       2. If slug changed (new window started), fetch fresh market data
       3. Update bid/ask/expiry for the quote engine
+
+    CLOB WebSocket subscribes to channel "book" for the active condition_id
+    and overwrites _best_bid/_best_ask on every book event (~sub-second).
+    REST poll remains active as a correction layer (e.g. after top-of-book
+    removals that the incremental WS path may miss).
     """
+
+    CLOB_WS = "wss://clob.polymarket.com/ws/"
 
     def __init__(self, poll_interval: float = 10.0):
         self._poll_interval = poll_interval
@@ -60,22 +75,53 @@ class PolymarketGammaFeed:
         self._end_date_iso: str | None = None
         self._last_update: float = 0.0
         self._last_slug: str = ""
+        self._yes_token_id: str | None = None
+        self._no_token_id: str | None = None
+
+        # Persistent HTTP session (created in start(), closed in stop())
+        self._session: aiohttp.ClientSession | None = None
+
+        # Fallback tracking
+        self._slug_miss_count: int = 0
+        self._using_cached_market: bool = False
+
+        # CLOB WebSocket state
+        self._ws_task: asyncio.Task | None = None
+        self._subscribed_cid: str | None = None  # cid currently subscribed on the WS
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self):
         self._running = True
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        )
         await self._fetch_current()
         self._task = asyncio.create_task(self._poll_loop())
+        if HAS_WEBSOCKETS:
+            self._ws_task = asyncio.create_task(
+                self._ws_book_listener(), name="clob_book_ws"
+            )
+        else:
+            logger.warning("PolymarketGamma: websockets not installed, using REST-only bid/ask")
 
     async def stop(self):
         self._running = False
+        if self._ws_task and not self._ws_task.done():
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except asyncio.CancelledError:
+                pass
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     # ── Polling ───────────────────────────────────────────────────────────────
 
@@ -84,10 +130,96 @@ class PolymarketGammaFeed:
             await asyncio.sleep(self._poll_interval)
             await self._fetch_current()
 
+    # ── CLOB WebSocket ─────────────────────────────────────────────────────────
+
+    async def _ws_book_listener(self) -> None:
+        """
+        Maintain a persistent CLOB WebSocket connection and subscribe to the
+        'book' channel for the active condition_id.  Updates _best_bid and
+        _best_ask sub-second from book snapshots and price_change events.
+        Resubscribes automatically when the condition_id rotates (new 5-min window).
+        Reconnects with 5-second backoff on any error.
+        """
+        while self._running:
+            try:
+                async with websockets.connect(
+                    self.CLOB_WS, ping_interval=20, ping_timeout=10
+                ) as ws:
+                    self._subscribed_cid = None
+                    logger.info("PolymarketGamma WS: connected to CLOB book channel")
+                    while self._running:
+                        cid = self._condition_id
+                        if cid and cid != self._subscribed_cid:
+                            await ws.send(json.dumps({
+                                "type": "subscribe",
+                                "channel": "book",
+                                "market": cid,
+                            }))
+                            self._subscribed_cid = cid
+                            logger.debug(f"PolymarketGamma WS: subscribed to book for {cid[:16]}…")
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                            self._handle_book_msg(raw)
+                        except asyncio.TimeoutError:
+                            pass  # no message yet; loop to check for cid rotation
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                self._subscribed_cid = None
+                exc_str = str(exc)
+                # HTTP 404/401/403 = endpoint unavailable without auth credentials.
+                # No point retrying — fall back to REST-only bid/ask (10s polls).
+                if any(f"HTTP {c}" in exc_str for c in ("404", "401", "403")):
+                    logger.info(
+                        "PolymarketGamma WS: book channel unavailable without CLOB "
+                        "credentials (HTTP error) — using REST-only bid/ask updates."
+                    )
+                    return
+                logger.warning(
+                    f"PolymarketGamma WS: disconnected ({exc}); reconnecting in 5s"
+                )
+                await asyncio.sleep(5)
+
+    def _handle_book_msg(self, raw: str) -> None:
+        """Parse a CLOB WebSocket message and update top-of-book bid/ask."""
+        try:
+            msgs = json.loads(raw)
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+            for msg in msgs:
+                etype = msg.get("event_type")
+                if etype == "book":
+                    # Full book snapshot: buys sorted desc, sells sorted asc
+                    buys = msg.get("buys") or []
+                    sells = msg.get("sells") or []
+                    if buys:
+                        self._best_bid = float(buys[0]["price"])
+                    if sells:
+                        self._best_ask = float(sells[0]["price"])
+                    if buys or sells:
+                        self._last_update = time.time()
+                elif etype == "price_change":
+                    # Incremental update: raise top bid or lower top ask on new levels;
+                    # removals (size==0) of the current top are left for REST poll to correct
+                    for change in msg.get("changes") or []:
+                        side = change.get("side", "").lower()
+                        price = float(change.get("price", 0))
+                        size = float(change.get("size", 0))
+                        if size == 0:
+                            continue  # level removed — REST poll will correct within 10s
+                        if side == "buy" and price > self._best_bid:
+                            self._best_bid = price
+                            self._last_update = time.time()
+                        elif side == "sell" and (self._best_ask <= 0 or price < self._best_ask):
+                            self._best_ask = price
+                            self._last_update = time.time()
+        except Exception as exc:
+            logger.debug(f"PolymarketGamma WS parse error: {exc}")
+
     async def _fetch_current(self):
         """Fetch the current 5-min window market using its deterministic slug."""
-        # Try current window, fall back to previous if not live yet
-        for offset in [0, -1]:
+        # Try current window → next (pre-published) → previous (just ended)
+        for offset in [0, 1, -1]:
             slug = _current_slug(offset)
             if slug == self._last_slug and offset == 0:
                 # Same window, data is still valid — skip re-fetch unless stale
@@ -95,24 +227,45 @@ class PolymarketGammaFeed:
                     return
             market = await self._fetch_by_slug(slug)
             if market:
+                self._slug_miss_count = 0
                 self._parse(market, slug)
                 return
 
-        logger.debug("Gamma: no active 5-min BTC market found for current window")
+        # All slug offsets missed
+        self._slug_miss_count += 1
+
+        # After 3 consecutive misses, try tag-based search as fallback
+        if self._slug_miss_count >= 3:
+            market = await self._fetch_by_tag_search()
+            if market:
+                self._slug_miss_count = 0
+                self._parse(market, slug=f"tag-fallback-{int(time.time())}")
+                return
+
+        # Log only once when we first fall back to cached data
+        if self._condition_id and not self._using_cached_market:
+            self._using_cached_market = True
+            logger.debug(
+                f"Gamma: using cached market {(self._condition_id or '')[:16]}… "
+                f"(slug miss #{self._slug_miss_count})"
+            )
+        elif not self._condition_id:
+            logger.debug("Gamma: no active 5-min BTC market found for current window")
 
     async def _fetch_by_slug(self, slug: str) -> dict | None:
         """Query GET /events?slug=<slug> and return the first market inside."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{_GAMMA_BASE}/events",
-                    params={"slug": slug},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.debug(f"Gamma slug {slug}: HTTP {resp.status}")
-                        return None
-                    events = await resp.json()
+            session = self._session or aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
+            async with session.get(
+                f"{_GAMMA_BASE}/events",
+                params={"slug": slug},
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug(f"Gamma slug {slug}: HTTP {resp.status}")
+                    return None
+                events = await resp.json()
 
             if not events:
                 return None
@@ -132,9 +285,45 @@ class PolymarketGammaFeed:
             logger.debug(f"Gamma fetch error for slug {slug}: {e}")
             return None
 
+    async def _fetch_by_tag_search(self) -> dict | None:
+        """
+        Fallback: query GET /events?tag=btc&closed=false&limit=5
+        and find any 5-minute BTC UP/DOWN market by title keyword.
+        Used after 3 consecutive slug misses.
+        """
+        try:
+            session = self._session or aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
+            async with session.get(
+                f"{_GAMMA_BASE}/events",
+                params={"tag": "btc", "closed": "false", "limit": "5"},
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                events = await resp.json()
+
+            for event in (events or []):
+                title = (event.get("title") or event.get("slug") or "").lower()
+                if not any(kw in title for kw in ("5m", "5-min", "updown-5m", "5 min")):
+                    continue
+                markets = event.get("markets") or []
+                if not markets:
+                    continue
+                market = markets[0]
+                market["_event_endDate"] = event.get("endDate") or event.get("endDateIso") or ""
+                market["_event_title"] = event.get("title") or ""
+                logger.info(f"Gamma tag-fallback: found market '{market['_event_title']}'")
+                return market
+
+        except Exception as e:
+            logger.debug(f"Gamma tag-fallback error: {e}")
+        return None
+
     # ── Parsing ───────────────────────────────────────────────────────────────
 
     def _parse(self, market: dict, slug: str):
+        self._using_cached_market = False
         self._condition_id = market.get("conditionId") or market.get("id")
         self._last_slug = slug
 
@@ -158,6 +347,14 @@ class PolymarketGammaFeed:
                 mid = float(prices[0])
                 self._best_bid = max(0.01, mid - raw_spread / 2)
                 self._best_ask = min(0.99, mid + raw_spread / 2)
+
+        for token in market.get("tokens", []):
+            outcome = token.get("outcome", "").lower()
+            tid = token.get("token_id")
+            if outcome in ("yes", "1") and tid:
+                self._yes_token_id = tid
+            elif outcome in ("no", "0") and tid:
+                self._no_token_id = tid
 
         self._last_update = time.time()
         logger.debug(
@@ -193,6 +390,14 @@ class PolymarketGammaFeed:
         return self._best_ask
 
     @property
+    def yes_token_id(self) -> str | None:
+        return self._yes_token_id
+
+    @property
+    def no_token_id(self) -> str | None:
+        return self._no_token_id
+
+    @property
     def is_fresh(self) -> bool:
         return (time.time() - self._last_update) < 30.0
 
@@ -211,4 +416,6 @@ class PolymarketGammaFeed:
             "spread": f"{self.market_spread:.4f}",
             "seconds_to_expiry": f"{self.seconds_to_expiry:.0f}s",
             "fresh": self.is_fresh,
+            "cached": self._using_cached_market,
+            "slug_misses": self._slug_miss_count,
         }
