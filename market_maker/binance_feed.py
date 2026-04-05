@@ -23,6 +23,10 @@ from loguru import logger
 
 _WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 _REST_URL = "https://api.binance.com/api/v3/ticker/price"
+
+# Kraken fallback (used when Binance is geo-restricted, e.g. HTTP 451)
+_KRAKEN_REST_URL = "https://api.kraken.com/0/public/Ticker"
+_KRAKEN_WS_URL = "wss://ws.kraken.com/v2"
 _HISTORY_SECONDS = 310  # slightly over 5 min to cover change_5m
 
 
@@ -65,7 +69,8 @@ class BinanceBTCFeed:
     # ── Data fetching ────────────────────────────────────────────────────────
 
     async def _fetch_rest_price(self):
-        """One-shot REST call to bootstrap the price before WebSocket connects."""
+        """Bootstrap price: try Binance first, fall back to Kraken."""
+        # Try Binance
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -73,14 +78,31 @@ class BinanceBTCFeed:
                     params={"symbol": "BTCUSDT"},
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
-                    data = await resp.json()
-                    self._record(float(data["price"]))
-                    logger.info(f"Binance REST bootstrap: BTC=${self._latest_price:,.2f}")
+                    if resp.status == 200:
+                        data = await resp.json()
+                        self._record(float(data["price"]))
+                        logger.info(f"Binance REST bootstrap: BTC=${self._latest_price:,.2f}")
+                        return
         except Exception as e:
             logger.warning(f"Binance REST bootstrap failed: {e}")
 
+        # Kraken fallback
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    _KRAKEN_REST_URL,
+                    params={"pair": "XBTUSD"},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    data = await resp.json()
+                    price = float(data["result"]["XXBTZUSD"]["c"][0])
+                    self._record(price)
+                    logger.info(f"Kraken REST bootstrap: BTC=${self._latest_price:,.2f}")
+        except Exception as e:
+            logger.warning(f"Kraken REST bootstrap failed: {e}")
+
     async def _ws_loop(self):
-        """Maintain persistent WebSocket with auto-reconnect."""
+        """Maintain persistent WebSocket — try Binance first, fall back to Kraken."""
         while self._running:
             try:
                 async with websockets.connect(
@@ -101,8 +123,43 @@ class BinanceBTCFeed:
             except Exception as e:
                 self._connected = False
                 if self._running:
-                    logger.warning(f"Binance WS disconnected ({e}). Reconnecting in 5s...")
+                    logger.warning(f"Binance WS disconnected ({e}). Trying Kraken fallback...")
+                    await self._kraken_ws_loop()
+
+    async def _kraken_ws_loop(self):
+        """Kraken WebSocket fallback for geo-restricted environments."""
+        while self._running:
+            try:
+                async with websockets.connect(
+                    _KRAKEN_WS_URL,
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as ws:
+                    sub = {
+                        "method": "subscribe",
+                        "params": {"channel": "trade", "symbol": ["BTC/USD"]},
+                    }
+                    await ws.send(json.dumps(sub))
+                    self._connected = True
+                    logger.info("Kraken WebSocket connected (BTC/USD trade feed)")
+                    async for raw in ws:
+                        if not self._running:
+                            break
+                        try:
+                            msg = json.loads(raw)
+                            # Kraken v2 trade message: {"channel":"trade","type":"update","data":[{"price":...},...]}
+                            if msg.get("channel") == "trade" and msg.get("type") in ("update", "snapshot"):
+                                for t in msg.get("data", []):
+                                    self._record(float(t["price"]))
+                        except (KeyError, ValueError, json.JSONDecodeError):
+                            pass
+            except Exception as e:
+                self._connected = False
+                if self._running:
+                    logger.warning(f"Kraken WS disconnected ({e}). Reconnecting in 5s...")
                     await asyncio.sleep(5)
+                    # Try Binance again after reconnect pause
+                    return
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
