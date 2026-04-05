@@ -70,6 +70,7 @@ class PolymarketGammaFeed:
 
         # Cached market state
         self._condition_id: str | None = None
+        self._market_id: str | None = None   # numeric Gamma market id for fast polling
         self._best_bid: float = 0.0
         self._best_ask: float = 1.0
         self._end_date_iso: str | None = None
@@ -98,6 +99,8 @@ class PolymarketGammaFeed:
         )
         await self._fetch_current()
         self._task = asyncio.create_task(self._poll_loop())
+        # Always start the CLOB REST book poller (2s updates, no auth needed)
+        asyncio.create_task(self._clob_book_loop(), name="clob_book_rest")
         if HAS_WEBSOCKETS:
             self._ws_task = asyncio.create_task(
                 self._ws_book_listener(), name="clob_book_ws"
@@ -129,6 +132,44 @@ class PolymarketGammaFeed:
         while self._running:
             await asyncio.sleep(self._poll_interval)
             await self._fetch_current()
+
+    async def _clob_book_loop(self):
+        """
+        Fast Gamma price poll every 3 seconds using the prices endpoint.
+        Updates best_bid/best_ask from outcomePrices + spread without
+        waiting for the full 10-second REST poll cycle.
+        """
+        while self._running:
+            await asyncio.sleep(3)
+            if not self._market_id:
+                continue
+            try:
+                session = self._session or aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=5)
+                )
+                # GET /markets/{numeric_id} — fastest per-market price endpoint
+                async with session.get(
+                    f"{_GAMMA_BASE}/markets/{self._market_id}",
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    best_bid = data.get("bestBid")
+                    best_ask = data.get("bestAsk")
+                    prices   = data.get("outcomePrices") or []
+                    spread   = float(data.get("spread") or 0.01)
+
+                    if best_bid is not None and best_ask is not None:
+                        self._best_bid = float(best_bid)
+                        self._best_ask = float(best_ask)
+                        self._last_update = time.time()
+                    elif prices:
+                        mid = float(prices[0])
+                        self._best_bid = max(0.01, mid - spread / 2)
+                        self._best_ask = min(0.99, mid + spread / 2)
+                        self._last_update = time.time()
+            except Exception as e:
+                logger.debug(f"Fast price poll error: {e}")
 
     # ── CLOB WebSocket ─────────────────────────────────────────────────────────
 
@@ -221,10 +262,6 @@ class PolymarketGammaFeed:
         # Try current window → next (pre-published) → previous (just ended)
         for offset in [0, 1, -1]:
             slug = _current_slug(offset)
-            if slug == self._last_slug and offset == 0:
-                # Same window, data is still valid — skip re-fetch unless stale
-                if time.time() - self._last_update < 30:
-                    return
             market = await self._fetch_by_slug(slug)
             if market:
                 self._slug_miss_count = 0
@@ -325,6 +362,7 @@ class PolymarketGammaFeed:
     def _parse(self, market: dict, slug: str):
         self._using_cached_market = False
         self._condition_id = market.get("conditionId") or market.get("id")
+        self._market_id = str(market.get("id") or "")   # numeric id for fast REST polling
         self._last_slug = slug
 
         # Use event-level endDate (most reliable)
@@ -348,12 +386,26 @@ class PolymarketGammaFeed:
                 self._best_bid = max(0.01, mid - raw_spread / 2)
                 self._best_ask = min(0.99, mid + raw_spread / 2)
 
+        # Extract token IDs — Gamma API uses clobTokenIds list aligned with outcomes[]
+        # e.g. outcomes=["Up","Down"] → clobTokenIds[0]=YES token, clobTokenIds[1]=NO token
+        clob_ids = market.get("clobTokenIds") or []
+        outcomes  = market.get("outcomes") or []
+        for i, tid in enumerate(clob_ids):
+            if not tid:
+                continue
+            label = outcomes[i].lower() if i < len(outcomes) else ""
+            if label in ("up", "yes", "1") or i == 0:
+                self._yes_token_id = tid
+            elif label in ("down", "no", "0") or i == 1:
+                self._no_token_id = tid
+
+        # Legacy fallback: old tokens array format
         for token in market.get("tokens", []):
             outcome = token.get("outcome", "").lower()
             tid = token.get("token_id")
-            if outcome in ("yes", "1") and tid:
+            if outcome in ("yes", "up", "1") and tid:
                 self._yes_token_id = tid
-            elif outcome in ("no", "0") and tid:
+            elif outcome in ("no", "down", "0") and tid:
                 self._no_token_id = tid
 
         self._last_update = time.time()
