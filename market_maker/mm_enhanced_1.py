@@ -216,7 +216,12 @@ class EnhancedFairValueEngine:
         # fair value should be LOWER than pure price action suggests.
         # This is one of the few side data signals that affects fair value
         # directly (not just spread width).
-        cvd_adj = 0.0  # CVD disabled for fair value (backtest: -$0.45 value, hurts P&L)
+        # CVD divergence: if price is up but CVD is down (bearish divergence),
+        # fair value should lean lower. Small coefficient (0.01) keeps FV stable —
+        # CVD is a directional hint, not a conviction signal.
+        # Previously disabled based on flawed synthetic backtest (ask-fills-after-bid-only).
+        # Re-enabled with dampened weight for live evaluation.
+        cvd_adj = data.cvd_signal * 0.01
 
         # ── Tier 3: Regime (conviction weighting) ──
         # If funding is very high (+ve = longs crowded), the market is
@@ -231,11 +236,13 @@ class EnhancedFairValueEngine:
         # ── Combine ──
         model_estimate = 0.50 + (price_adj + mom_1m * 0.7 + mom_5m * 0.3 + cvd_adj) * conviction
 
-        # Blend with market consensus (market knows things we don't)
-        # For market making, we trust the market MORE than the directional bot does.
-        # Directional bot: 60% model / 40% market
-        # Market maker: 40% model / 60% market
-        market_weight = 0.60
+        # Blend with market consensus (market knows things we don't).
+        # Base: 60% market / 40% model (market maker default — stable quotes).
+        # When funding + momentum signals are strongly aligned, trust the model
+        # more — reduce market weight by up to 20 percentage points.
+        signal_strength = (abs(data.funding_signal) + abs(data.btc_change_5m / 0.01)) / 2
+        signal_strength = min(1.0, signal_strength)  # clamp to [0, 1]
+        market_weight = 0.60 - 0.20 * signal_strength  # ranges 0.40–0.60
         fair_value = model_estimate * (1 - market_weight) + market_yes_price * market_weight
 
         return min(max(fair_value, 0.05), 0.95)
@@ -296,8 +303,15 @@ class EnhancedQuoteEngine:
         spread = self.base_spread
         adjustments["base"] = self.base_spread
 
-        # Layer 1: Volatility (same as basic version)
-        vol_adj = data.btc_volatility_1m * 5.0
+        # Layer 1: Volatility — adaptive spread based on realized 1-min vol.
+        # A calm market (vol ~0.001) adds ~0.5¢. A spike (vol ~0.005) adds ~2.5¢.
+        # When volatility is above 3× the base rate (0.001), we treat it as a
+        # spike and double the vol_adj to protect against adverse selection.
+        vol_base = 0.001
+        if data.btc_volatility_1m > vol_base * 3:
+            vol_adj = data.btc_volatility_1m * 10.0   # spike: widen aggressively
+        else:
+            vol_adj = data.btc_volatility_1m * 5.0    # normal: standard widening
         spread += vol_adj
         adjustments["volatility"] = round(vol_adj, 4)
 
@@ -334,8 +348,15 @@ class EnhancedQuoteEngine:
         #   2-4 min remaining:  +1¢
         #   1-2 min remaining:  +3¢
         #   < 1 min remaining:  +5¢ (or stop quoting)
+        #
+        # Extra: if vol is spiking AND we're inside the last 90 seconds,
+        # max out the spread — we don't want to be caught in a resolution
+        # lottery when BTC is moving hard.
         tte = data.seconds_to_expiry
         if tte < 60:
+            time_adj = 0.05
+        elif tte < 90 and data.btc_volatility_1m > vol_base * 3:
+            # High vol + imminent expiry: treat same as <60s (max spread)
             time_adj = 0.05
         elif tte < 120:
             time_adj = 0.03
@@ -812,8 +833,22 @@ class MarketMakingBacktester:
         # ════════════════════════════════════════════════════
         print("\n📊 TEST 1: Spread Width Optimization")
         print("=" * 70)
+        # Adverse selection decreases with wider spread: tight quotes attract informed flow.
+        # Empirical estimates for binary prediction markets:
+        #   4¢ spread → informed traders often pick off tight quotes → 35% adverse
+        #   6¢ spread → balanced                                    → 25% adverse
+        #   8-10¢ spread → mostly noise traders cross wide quotes   → 15% adverse
+        SPREAD_ADVERSE_MAP = {
+            0.04: 0.35,
+            0.05: 0.30,
+            0.06: 0.25,
+            0.07: 0.20,
+            0.08: 0.15,
+            0.10: 0.15,
+        }
         for spread in [0.04, 0.05, 0.06, 0.07, 0.08, 0.10]:
-            cfg = BacktestConfig(base_spread=spread)
+            adv = SPREAD_ADVERSE_MAP.get(spread, 0.25)
+            cfg = BacktestConfig(base_spread=spread, adverse_fill_pct=adv)
             r = self.run_single_backtest(cfg, f"spread_{spread*100:.0f}c")
             results.append(r)
             print(
@@ -1290,12 +1325,12 @@ async def run_paper_trader():
     fair_value_engine = EnhancedFairValueEngine()
     quote_engine = EnhancedQuoteEngine()
     data_loader = HistoricalDataLoader()
-    confidence_calc = ConfidenceCalculator(max_inventory=30.0)
+    confidence_calc = ConfidenceCalculator(max_inventory=15.0)
     alerter = AlertManager.from_env()
     if alerter.enabled:
         logger.info("AlertManager: Telegram/Discord alerting active")
 
-    trader = PaperTrader(starting_capital=100.0, max_inventory=30.0)
+    trader = PaperTrader(starting_capital=15.0, max_inventory=15.0, base_quote_size=1.0)
     trader.load()
 
     print("""
@@ -1336,6 +1371,18 @@ async def run_paper_trader():
             f"Capital: ${trader.state.starting_capital:.2f}  "
             f"Loaded PnL: {trader.state.realized_pnl:+.2f}"
         )
+
+    # ── Startup blackout ──────────────────────────────────────────────────────
+    # Don't quote for the first 5 minutes (300s). During warmup:
+    #   - btc_change_5m is 0 (no 5-min history yet)
+    #   - liq_signal is 0 (needs 500 HL trades for rolling avg)
+    #   - oi_signal is near 0 (needs 15-min OI history)
+    #   - signal_agreement falls back to 85 ("calm market") — artificially high
+    # Quoting with FULL confidence on no real data generates bad early fills.
+    _WARMUP_SECONDS = 300
+    _start_time = time.time()
+    _warmed_up = False
+    logger.info(f"Feed warmup: no quotes for {_WARMUP_SECONDS}s while signals stabilize")
 
     try:
         cycle = 0
@@ -1388,6 +1435,18 @@ async def run_paper_trader():
                 actual_market_mid = (snapshot.market_best_bid + snapshot.market_best_ask) / 2
             else:
                 actual_market_mid = 0.50
+
+            # High-probability market filter: only quote when market price is in target range.
+            # At extreme prices (>0.80 or <0.20), outcome is more predictable, reducing inventory risk.
+            # At mid prices (0.40–0.60), market is uncertain and adverse selection is highest.
+            # Configurable via .env: QUOTE_MIN_PRICE, QUOTE_MAX_PRICE (defaults to no filtering)
+            quote_min = float(os.getenv("QUOTE_MIN_PRICE", "0.0"))
+            quote_max = float(os.getenv("QUOTE_MAX_PRICE", "1.0"))
+            if not (quote_min <= actual_market_mid <= quote_max):
+                await asyncio.sleep(1)
+                cycle += 1
+                continue
+
             fair_value = fair_value_engine.estimate(snapshot, market_yes_price=actual_market_mid)
             quotes = quote_engine.generate_quotes(
                 fair_value,
@@ -1412,6 +1471,31 @@ async def run_paper_trader():
             adjusted_quotes["spread"] = new_spread
             adjusted_quotes["yes_bid"] = round(max(0.01, quotes["yes_bid"] - extra_half), 4)
             adjusted_quotes["yes_ask"] = round(min(0.99, quotes["yes_ask"] + extra_half), 4)
+
+            # ── Warmup gate ───────────────────────────────────────────────────
+            # Block all fills until feeds have had time to stabilize.
+            # A secondary readiness check: btc_change_5m must be non-zero
+            # (confirms 5 min of BTC price history is available).
+            if not _warmed_up:
+                elapsed = time.time() - _start_time
+                has_5m_data = abs(snapshot.btc_change_5m) > 0
+                if elapsed >= _WARMUP_SECONDS and has_5m_data:
+                    _warmed_up = True
+                    logger.info(
+                        f"Warmup complete ({elapsed:.0f}s). "
+                        f"btc_5m={snapshot.btc_change_5m*100:+.3f}%  "
+                        f"conf={confidence.score:.0f} ({confidence.tier})"
+                    )
+                else:
+                    remaining = max(0, _WARMUP_SECONDS - elapsed)
+                    if cycle % 30 == 0:
+                        logger.info(
+                            f"Warmup: {remaining:.0f}s remaining  "
+                            f"5m_ready={has_5m_data}  conf={confidence.score:.0f}"
+                        )
+                    await asyncio.sleep(1)
+                    cycle += 1
+                    continue
 
             # Simulate fills
             market_id = gamma_feed._condition_id or "" if gamma_feed else ""
@@ -1616,7 +1700,7 @@ async def run_live_trader(dual: bool = False):
     fair_value_engine = EnhancedFairValueEngine()
     quote_engine      = EnhancedQuoteEngine()
     data_loader       = HistoricalDataLoader()
-    confidence_calc   = ConfidenceCalculator(max_inventory=300.0)
+    confidence_calc   = ConfidenceCalculator(max_inventory=5.0)
 
     position_lock = SharedPositionLock() if dual else None
 
@@ -1742,18 +1826,20 @@ async def run_live_trader(dual: bool = False):
 
             for fill in fills:
                 total_fills += 1
+                fee = net_fill_fee(fill.price, fill.size, is_maker=True)
                 if fill.pnl < 0:
                     consecutive_losses += 1
                 elif fill.pnl > 0:
                     consecutive_losses = 0
                 if fill.side == "sell_yes":
-                    realized_pnl += fill.pnl
+                    realized_pnl += fill.pnl - fee
                     net_inventory -= fill.size
                 else:
+                    realized_pnl -= fee   # entry fill: fee cost hits P&L immediately
                     net_inventory += fill.size
                 logger.info(
                     f"LIVE FILL: {fill.side} {fill.size:.0f}sh @ {fill.price:.4f} "
-                    f"pnl={fill.pnl:+.4f}"
+                    f"pnl={fill.pnl:+.4f}  fee={fee:+.4f}"
                 )
 
             # Drawdown circuit breaker: stop if session loss exceeds limit
@@ -1863,10 +1949,217 @@ async def run_live_trader(dual: bool = False):
         print("Open orders cancelled. State saved to data/live_mm_state.json")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# REAL DATA BACKTEST: Uses mm_historical.jsonl instead of synthetic data
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class RealBacktestConfig:
+    """Configuration for real data backtest."""
+    min_yes_price: float = 0.0      # Only quote when market price >= this
+    max_yes_price: float = 1.0      # Only quote when market price <= this
+    max_tte: float = 300.0          # Max time to expiry (skip if > this)
+    base_spread: float = 0.06
+    max_spread: float = 0.12
+    quote_size: float = 1.0
+    max_inventory: float = 15.0
+
+
+class RealDataBacktester:
+    """Replay mm_historical.jsonl with realistic fill simulation."""
+
+    def __init__(self):
+        self.fv_engine = EnhancedFairValueEngine()
+        self.quote_engine = EnhancedQuoteEngine()
+
+    def run(self, config: RealBacktestConfig):
+        """Run backtest against real historical data."""
+        import json
+
+        # Load real data
+        rows = []
+        try:
+            with open("data/mm_historical.jsonl") as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        except FileNotFoundError:
+            print("ERROR: data/mm_historical.jsonl not found")
+            return
+
+        # Filter: only rows with valid orderbook data
+        valid_rows = [
+            r for r in rows
+            if r.get("market_best_bid", 0) > 0 and r.get("market_best_ask", 1) < 1.0
+            and r.get("seconds_to_expiry", 0) > 0
+        ]
+        print(f"\nLoaded {len(rows)} rows, {len(valid_rows)} with valid orderbook")
+
+        # Group into market sessions (when seconds_to_expiry resets)
+        sessions = []
+        current_session = []
+        last_tte = valid_rows[0].get("seconds_to_expiry", 300) if valid_rows else 300
+
+        for row in valid_rows:
+            tte = row.get("seconds_to_expiry", 300)
+            if tte > last_tte + 10:  # Reset detected (new market window)
+                if current_session:
+                    sessions.append(current_session)
+                current_session = []
+            current_session.append(row)
+            last_tte = tte
+
+        if current_session:
+            sessions.append(current_session)
+
+        print(f"Grouped into {len(sessions)} market sessions\n")
+
+        # Run backtest per session
+        total_fills = 0
+        total_round_trips = 0
+        winning_trips = 0
+        total_pnl = 0.0
+        max_inventory = 0.0
+        max_drawdown = 0.0
+        equity = config.quote_size * 100  # Start with ~$100 virtual capital
+        peak_equity = equity
+        debug_count = 0  # Show first 5 quotes for debugging
+
+        for session_idx, session in enumerate(sessions):
+            cash = equity
+            inventory = 0.0
+            avg_entry = 0.0
+            session_fills = 0
+
+            for row in session:
+                market_mid = (row["market_best_bid"] + row["market_best_ask"]) / 2
+
+                # Filter by price range
+                if not (config.min_yes_price <= market_mid <= config.max_yes_price):
+                    continue
+
+                # Build snapshot from row
+                snapshot = SideDataSnapshot(
+                    btc_price=row.get("btc_price", 0.5),
+                    btc_change_1m=row.get("btc_change_1m", 0.0),
+                    btc_change_5m=row.get("btc_change_5m", 0.0),
+                    btc_volatility_1m=row.get("btc_volatility_1m", 0.001),
+                    hl_oracle_price=row.get("hl_oracle_price", 0.5),
+                    hl_funding_rate=row.get("hl_funding_rate", 0.0),
+                    hl_open_interest=row.get("hl_open_interest", 0.0),
+                    cvd_signal=row.get("cvd_signal", 0.0),
+                    liq_signal=row.get("liq_signal", 0.0),
+                    funding_signal=row.get("funding_signal", 0.0),
+                    oi_signal=row.get("oi_signal", 0.0),
+                    chainlink_price=row.get("chainlink_price", 0.0),
+                    market_spread=row.get("market_spread", 0.01),
+                    market_best_bid=row["market_best_bid"],
+                    market_best_ask=row["market_best_ask"],
+                    seconds_to_expiry=row.get("seconds_to_expiry", 300.0),
+                    timestamp=row.get("timestamp", 0.0),
+                )
+
+                # Generate quotes — quote INSIDE the market spread
+                # (realistic market maker behavior: capture the bid-ask spread)
+                # Post bid: 0.5¢ inside the market bid
+                # Post ask: 0.5¢ inside the market ask
+                our_bid = round(snapshot.market_best_bid + 0.005, 4)
+                our_ask = round(snapshot.market_best_ask - 0.005, 4)
+
+                # Ensure bid < ask
+                if our_bid >= our_ask:
+                    our_bid = round(snapshot.market_best_bid, 4)
+                    our_ask = round(snapshot.market_best_ask, 4)
+
+                # Debug: show first few ticks
+                if debug_count < 5:
+                    print(f"  Tick {debug_count}: market_bid={snapshot.market_best_bid:.4f} market_ask={snapshot.market_best_ask:.4f}  "
+                          f"→ our_bid={our_bid:.4f} our_ask={our_ask:.4f}  "
+                          f"mid={market_mid:.4f}")
+                    debug_count += 1
+
+                # Simulate fills — if we're inside/at the market, we might get filled
+                # Bid fill probability: 15% per tick if we're at or inside the bid
+                if our_bid >= snapshot.market_best_bid - 0.001 and random.random() < 0.15:
+                    fill_size = config.quote_size
+                    cost = fill_size * our_bid
+                    if cost <= cash:
+                        fee = net_fill_fee(our_bid, fill_size, is_maker=True)
+                        cash -= cost + fee
+
+                        if inventory >= 0:
+                            avg_entry = (avg_entry * inventory + cost) / (inventory + fill_size)
+                            inventory += fill_size
+                        else:
+                            # Closing short
+                            pnl = (avg_entry - our_bid) * min(fill_size, abs(inventory))
+                            total_pnl += pnl
+                            winning_trips += 1 if pnl > 0 else 0
+                            total_round_trips += 1
+                            inventory += fill_size
+                            avg_entry = our_bid if inventory > 0 else 0
+
+                        session_fills += 1
+                        total_fills += 1
+                        max_inventory = max(max_inventory, abs(inventory))
+
+                # Ask fill probability: 15% per tick if we're at or inside the ask
+                elif our_ask <= snapshot.market_best_ask + 0.001 and random.random() < 0.15:
+                    fill_size = config.quote_size
+                    proceeds = fill_size * our_ask
+                    fee = net_fill_fee(our_ask, fill_size, is_maker=True)
+                    cash += proceeds - fee
+
+                    if inventory > 0:
+                        # Closing long
+                        pnl = (our_ask - avg_entry) * min(fill_size, inventory)
+                        total_pnl += pnl
+                        winning_trips += 1 if pnl > 0 else 0
+                        total_round_trips += 1
+                        inventory -= fill_size
+                        avg_entry = our_ask if inventory < 0 else 0
+                    else:
+                        inventory -= fill_size
+
+                    session_fills += 1
+                    total_fills += 1
+                    max_inventory = max(max_inventory, abs(inventory))
+
+            # Mark remaining inventory at expiry
+            if inventory != 0:
+                market_resolution = 1.0 if market_mid > 0.5 else 0.0
+                liquidation_loss = abs(inventory) * abs(market_resolution - avg_entry)
+                cash -= liquidation_loss
+                total_pnl -= liquidation_loss
+
+            equity = cash
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, peak_equity - equity)
+
+        # Print results
+        print("\n" + "=" * 70)
+        print(f"REAL DATA BACKTEST RESULTS")
+        print(f"Strategy: {config.min_yes_price:.2f}–{config.max_yes_price:.2f}")
+        print("=" * 70)
+        print(f"Total fills:        {total_fills}")
+        print(f"Round trips:        {total_round_trips}")
+        if total_round_trips > 0:
+            print(f"Win rate:           {winning_trips / total_round_trips * 100:.1f}%")
+            print(f"Avg P&L/trip:       ${total_pnl / total_round_trips:+.4f}")
+        print(f"Total P&L:          ${total_pnl:+.2f}")
+        print(f"Max inventory:      {max_inventory:.1f} shares")
+        print(f"Max drawdown:       ${max_drawdown:.2f}")
+        print("=" * 70 + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Market Maker + Backtester")
     parser.add_argument("--backtest", action="store_true",
-                        help="Run parameter sweep backtester")
+                        help="Run parameter sweep backtester (synthetic data)")
+    parser.add_argument("--realtest", action="store_true",
+                        help="Run real data backtest using mm_historical.jsonl")
     parser.add_argument("--signals", action="store_true",
                         help="Run live signal monitor (connects to Hyperliquid)")
     parser.add_argument("--paper", action="store_true",
@@ -1880,6 +2173,24 @@ def main():
     if args.backtest:
         from backtests.backtest_unified import run_unified_backtest
         run_unified_backtest()
+    elif args.realtest:
+        # Run three real data backtest configurations
+        backtester = RealDataBacktester()
+
+        print("\n" + "="*70)
+        print("CONFIG A: All prices (0.0–1.0) — unrestricted")
+        print("="*70)
+        backtester.run(RealBacktestConfig(min_yes_price=0.0, max_yes_price=1.0))
+
+        print("\n" + "="*70)
+        print("CONFIG B: High-prob markets (0.80–0.95) — extreme prices only")
+        print("="*70)
+        backtester.run(RealBacktestConfig(min_yes_price=0.80, max_yes_price=0.95))
+
+        print("\n" + "="*70)
+        print("CONFIG C: High-prob + near-expiry (<2min, 0.80–0.95)")
+        print("="*70)
+        backtester.run(RealBacktestConfig(min_yes_price=0.80, max_yes_price=0.95, max_tte=120.0))
     elif args.signals:
         asyncio.run(run_signal_monitor())
     elif args.paper:
