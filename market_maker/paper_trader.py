@@ -24,7 +24,7 @@ from typing import Optional
 
 from loguru import logger
 
-from fees import net_fill_fee
+from fees import net_fill_fee, GAS_COST_PER_TX
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -42,8 +42,8 @@ class Fill:
 @dataclass
 class PaperState:
     # Capital tracking
-    starting_capital: float = 1000.0
-    cash: float = 1000.0
+    starting_capital: float = 50.0
+    cash: float = 50.0
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
 
@@ -58,9 +58,10 @@ class PaperState:
 
     # Risk tracking
     session_start: float = field(default_factory=time.time)
-    peak_capital: float = 1000.0
+    peak_capital: float = 50.0
     max_drawdown: float = 0.0
     consecutive_losses: int = 0
+    total_gas_cost: float = 0.0
 
     # Recent fills (last 100)
     recent_fills: list = field(default_factory=list)
@@ -100,16 +101,18 @@ class PaperTrader:
     FILL_PROBABILITY = 0.15
 
     # Default quote size in shares
-    BASE_QUOTE_SIZE = 10.0
+    BASE_QUOTE_SIZE = 1.0
 
     def __init__(
         self,
-        starting_capital: float = 1000.0,
+        starting_capital: float = 50.0,
         max_inventory: float = 300.0,
+        base_quote_size: float = 1.0,
         state_file: str = "data/paper_mm_state.json",
         fills_file: str = "data/paper_mm_fills.json",
     ):
         self.max_inventory = max_inventory
+        self.base_quote_size = base_quote_size
         self.state_file = state_file
         self.fills_file = fills_file
         self._all_fills: list[Fill] = []
@@ -126,6 +129,20 @@ class PaperTrader:
         try:
             with open(self.state_file) as f:
                 data = json.load(f)
+
+            # ── Capital mismatch guard ──
+            # If the saved session used a different capital, old cash and P&L
+            # values are meaningless. Start completely fresh instead of loading
+            # a corrupted baseline.
+            saved_capital = data.get("starting_capital", self.state.starting_capital)
+            if abs(saved_capital - self.state.starting_capital) > 0.01:
+                logger.warning(
+                    f"Paper trader: saved capital ${saved_capital:.2f} != "
+                    f"configured ${self.state.starting_capital:.2f}. "
+                    f"Ignoring stale state — starting fresh."
+                )
+                return
+
             # Only restore capital/PnL fields, not current market data
             self.state.cash = data.get("cash", self.state.starting_capital)
             self.state.realized_pnl = data.get("realized_pnl", 0.0)
@@ -138,6 +155,7 @@ class PaperTrader:
             self.state.peak_capital = data.get("peak_capital", self.state.starting_capital)
             self.state.max_drawdown = data.get("max_drawdown", 0.0)
             self.state.recent_fills = data.get("recent_fills", [])
+            self.state.total_gas_cost = data.get("total_gas_cost", 0.0)
             logger.info(f"Paper trader loaded: cash=${self.state.cash:.2f} pnl={self.state.realized_pnl:+.2f}")
         except FileNotFoundError:
             logger.info("Paper trader: no saved state found, starting fresh")
@@ -223,35 +241,44 @@ class PaperTrader:
             market_best_bid = max(0.01, fv - half_mkt)
             market_best_ask = min(0.99, fv + half_mkt)
 
-        quote_size = self.BASE_QUOTE_SIZE * confidence_result.size_multiplier
+        quote_size = self.base_quote_size * confidence_result.size_multiplier
 
-        # Fill probability for a resting maker order:
-        # A taker crosses our quote with probability that decays exponentially
-        # as our quote moves further from the market best bid/ask.
-        #
-        # At our_bid == market_best_bid → full FILL_PROBABILITY (front of queue)
-        # At our_bid 2¢ below best bid  → ~37% of FILL_PROBABILITY (behind queue)
-        # At our_bid 6¢ below best bid  → ~5% of FILL_PROBABILITY (deep in book)
-        #
-        # This is the correct model: market makers post OUTSIDE the spread and
-        # get filled when takers send orders deep enough to reach us.
-        _DECAY = 0.02   # ¢-scale decay constant (2¢ = 1/e of base probability)
+        # Capital-based size cap: risk at most 0.5% of capital per order.
+        # At $50 capital and price ≈ 0.50, max = $0.25 / 0.50 = 0.5 shares.
+        # This prevents oversizing relative to account equity.
+        if our_bid > 0 or our_ask < 1.0:
+            ref_price = our_bid if our_bid > 0 else our_ask
+            max_size_by_capital = (self.state.cash * 0.005) / ref_price
+            quote_size = min(quote_size, max(0.1, max_size_by_capital))
 
-        bid_depth = max(0.0, market_best_bid - our_bid)
-        bid_prob = self.FILL_PROBABILITY * math.exp(-bid_depth / _DECAY)
+        # ── Fill realism: market-crossed check ──
+        # A resting bid fills ONLY when someone actively sells at or below
+        # our bid (market_best_ask <= our_bid). A resting ask fills ONLY
+        # when someone actively buys at or above our ask (market_best_bid >= our_ask).
+        # Without this check, quotes fill probabilistically at any price — wrong.
+        #
+        # Once the cross condition is met, we still apply a 15% queue-position
+        # probability to model that we might not be at the front of the book.
+        # If we are NOT crossed, fill probability is 0 (resting order, not touched).
+
         bid_filled = False
-        if our_bid > 0 and random.random() < bid_prob:
-            fill = self._fill_bid(our_bid, quote_size, market_id)
-            if fill:
-                fills.append(fill)
-                bid_filled = True
 
-        ask_depth = max(0.0, our_ask - market_best_ask)
-        ask_prob = self.FILL_PROBABILITY * math.exp(-ask_depth / _DECAY)
-        if not bid_filled and our_ask < 1.0 and random.random() < ask_prob:
-            fill = self._fill_ask(our_ask, quote_size, market_id)
-            if fill:
-                fills.append(fill)
+        bid_crossed = (market_best_ask <= our_bid)
+        if bid_crossed and our_bid > 0:
+            # Market is at or through our bid — we may be filled
+            if random.random() < self.FILL_PROBABILITY:
+                fill = self._fill_bid(our_bid, quote_size, market_id)
+                if fill:
+                    fills.append(fill)
+                    bid_filled = True
+
+        ask_crossed = (market_best_bid >= our_ask)
+        if ask_crossed and not bid_filled and our_ask < 1.0:
+            # Market is at or through our ask — we may be filled
+            if random.random() < self.FILL_PROBABILITY:
+                fill = self._fill_ask(our_ask, quote_size, market_id)
+                if fill:
+                    fills.append(fill)
 
         # Check for expiry: if market is expiring, close position
         if snapshot.seconds_to_expiry < 15 and abs(self.state.net_inventory) > 0:
@@ -294,6 +321,7 @@ class PaperTrader:
         fee = net_fill_fee(price, size, is_maker=True)
         self.state.cash -= fee
         self.state.realized_pnl -= fee
+        self.state.total_gas_cost += GAS_COST_PER_TX
         self.state.total_fills += 1
 
         fill = Fill(
@@ -329,6 +357,7 @@ class PaperTrader:
         fee = net_fill_fee(price, size, is_maker=True)
         self.state.cash -= fee
         self.state.realized_pnl -= fee
+        self.state.total_gas_cost += GAS_COST_PER_TX
         self.state.total_fills += 1
 
         if self.state.net_inventory <= 0:
