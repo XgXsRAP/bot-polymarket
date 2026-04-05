@@ -1217,12 +1217,10 @@ async def run_signal_monitor():
                 chainlink_feed.binance_price = btc_feed.price
 
             snapshot = SideDataSnapshot(
-                # BTC spot price — from Binance (real), fallback to HL oracle
                 btc_price=btc_fields.get("btc_price") or hl_fields["hl_oracle_price"],
                 btc_change_1m=btc_fields.get("btc_change_1m", 0.0),
                 btc_change_5m=btc_fields.get("btc_change_5m", 0.0),
                 btc_volatility_1m=btc_fields.get("btc_volatility_1m", 0.001),
-                # Hyperliquid derivatives signals
                 hl_oracle_price=hl_fields["hl_oracle_price"],
                 hl_funding_rate=hl_fields["hl_funding_rate"],
                 hl_open_interest=hl_fields["hl_open_interest"],
@@ -1230,15 +1228,16 @@ async def run_signal_monitor():
                 liq_signal=hl_fields["liq_signal"],
                 funding_signal=hl_fields["funding_signal"],
                 oi_signal=hl_fields["oi_signal"],
-                # Chainlink settlement price (Polygon on-chain)
                 chainlink_price=cl_fields.get("chainlink_price", 0.0),
-                # Polymarket market microstructure — from Gamma API
                 market_spread=gamma_fields.get("market_spread", 0.0),
+                # ← FIXED: capture actual YES bid/ask every tick
+                market_best_bid=gamma_feed.best_bid if gamma_feed else 0.0,
+                market_best_ask=gamma_feed.best_ask if gamma_feed else 1.0,
                 seconds_to_expiry=gamma_fields.get("seconds_to_expiry", 300.0),
                 timestamp=time.time(),
             )
 
-            # Record tick for future backtesting
+            # Record every single tick — no skipping
             data_loader.record_tick(snapshot)
 
             # Compute quotes
@@ -2154,12 +2153,470 @@ class RealDataBacktester:
         print("=" * 70 + "\n")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RESOLVER BACKTEST: Replay historical data with directional resolver logic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_resolver_backtest():
+    """
+    Replay mm_historical.jsonl with directional resolver logic.
+
+    Trades BOTH directions:
+      - YES: when market_mid > ENTRY_MIN (e.g. 80¢) → buy YES at market ask
+      - NO:  when market_mid < (1 - ENTRY_MIN) (e.g. 20¢) → buy NO at (1 - market_bid)
+
+    Resolution inference: use last tick's YES price.
+      - last_bid > 0.5 → YES won (BTC ended above strike)
+      - last_bid < 0.5 → NO won  (BTC ended below strike)
+      No sessions skipped — binary market always resolves one way.
+
+    Entry gate:
+      - seconds_to_expiry < RESOLVER_MAX_TTE (default 120s)
+      - BTC 1m momentum must confirm direction
+      - Only one trade per session
+    """
+    import json
+
+    entry_min = float(os.getenv("RESOLVER_MIN_PRICE", "0.80"))
+    entry_max = float(os.getenv("RESOLVER_MAX_PRICE", "0.95"))
+    max_tte   = float(os.getenv("RESOLVER_MAX_TTE",   "120"))
+    capital   = float(os.getenv("INITIAL_CAPITAL",    "100"))
+    risk_pct  = 0.05   # 5% of capital per trade
+
+    rows = []
+    try:
+        with open("data/mm_historical.jsonl") as f:
+            for line in f:
+                try: rows.append(json.loads(line))
+                except json.JSONDecodeError: pass
+    except FileNotFoundError:
+        print("ERROR: data/mm_historical.jsonl not found"); return
+
+    valid = [r for r in rows
+             if r.get("market_best_bid", 0) > 0
+             and r.get("market_best_ask", 1) < 1.0
+             and r.get("seconds_to_expiry", 0) > 0]
+
+    # Group into sessions (TTE resets when new market opens)
+    sessions, cur, last_tte = [], [], valid[0].get("seconds_to_expiry", 300) if valid else 300
+    for r in valid:
+        tte = r.get("seconds_to_expiry", 300)
+        if tte > last_tte + 10:
+            if cur: sessions.append(cur)
+            cur = []
+        cur.append(r)
+        last_tte = tte
+    if cur: sessions.append(cur)
+
+    print(f"\n{'='*65}")
+    print(f"RESOLVER BACKTEST  |  capital=${capital:.0f}  risk={risk_pct*100:.0f}%/trade")
+    print(f"Entry: {entry_min:.0%}–{entry_max:.0%} YES price  |  TTE < {max_tte:.0f}s")
+    print(f"Sessions in data: {len(sessions)}  ({len(sessions)/6.6:.0f}/day over 6.6 days)")
+    print(f"{'='*65}")
+
+    cash = capital
+    yes_trades = yes_wins = no_trades = no_wins = 0
+    total_pnl = 0.0
+    trade_log = []
+
+    for session in sessions:
+        # Resolution: last tick YES price > 0.5 → YES won
+        last_bid  = session[-1].get("market_best_bid", 0.5)
+        resolved_yes = last_bid > 0.5
+
+        # Find first qualifying entry tick
+        entry_row  = None
+        trade_dir  = None   # "YES" or "NO"
+
+        for row in session:
+            bid  = row.get("market_best_bid", 0)
+            ask  = row.get("market_best_ask", 1)
+            mid  = (bid + ask) / 2
+            tte  = row.get("seconds_to_expiry", 999)
+            m1m  = row.get("btc_change_1m", 0.0)
+
+            if tte > max_tte: continue
+
+            # YES opportunity: market near 80-95¢, BTC 1m still rising (or flat)
+            if entry_min <= mid <= entry_max and m1m >= 0:
+                entry_row = row; trade_dir = "YES"; break
+
+            # NO opportunity: market near 5-20¢ (NO is at 80-95¢), BTC 1m falling
+            if (1 - entry_max) <= mid <= (1 - entry_min) and m1m <= 0:
+                entry_row = row; trade_dir = "NO"; break
+
+        if entry_row is None:
+            continue
+
+        # --- Simulate fill ---
+        if trade_dir == "YES":
+            fill_price = entry_row["market_best_ask"]          # buy YES at ask
+            fee        = polymarket_taker_fee_amount(fill_price, 1)
+            cost_per   = fill_price + fee
+            size       = min(10.0, (cash * risk_pct) / cost_per)
+            size       = max(0.1, round(size, 2))
+            cost       = cost_per * size
+            if cost > cash: continue
+            cash      -= cost
+            # Resolution
+            won = resolved_yes
+            gross = size * 1.0 if won else 0.0
+            cash += gross
+            pnl   = gross - cost
+            yes_trades += 1
+            yes_wins   += 1 if won else 0
+
+        else:  # NO trade: buy NO = pay (1 - YES_bid), win if NO resolves
+            no_price   = 1.0 - entry_row["market_best_bid"]    # NO ask ≈ 1 - YES_bid
+            fee        = polymarket_taker_fee_amount(no_price, 1)
+            cost_per   = no_price + fee
+            size       = min(10.0, (cash * risk_pct) / cost_per)
+            size       = max(0.1, round(size, 2))
+            cost       = cost_per * size
+            if cost > cash: continue
+            cash      -= cost
+            # Resolution
+            won = not resolved_yes
+            gross = size * 1.0 if won else 0.0
+            cash += gross
+            pnl   = gross - cost
+            no_trades += 1
+            no_wins   += 1 if won else 0
+
+        total_pnl += pnl
+        trade_log.append({
+            "dir": trade_dir, "price": fill_price if trade_dir == "YES" else no_price,
+            "size": size, "won": won, "pnl": pnl, "cash": cash,
+        })
+
+    # Print trade log
+    for t in trade_log:
+        print(f"  {t['dir']:3s}  entry={t['price']:.2f}  size={t['size']:.2f}  "
+              f"{'WIN ' if t['won'] else 'LOSS'}  pnl=${t['pnl']:+.4f}  cash=${t['cash']:.2f}")
+
+    # Summary
+    total_trades = yes_trades + no_trades
+    total_wins   = yes_wins   + no_wins
+    print(f"\n{'='*65}")
+    print(f"RESULTS  —  {len(sessions)} sessions  |  {len(sessions)/6.6:.0f} sessions/day")
+    print(f"{'─'*65}")
+    print(f"  YES trades:  {yes_trades:3d}   wins: {yes_wins:3d}   "
+          f"({yes_wins/yes_trades*100:.0f}%)" if yes_trades else "  YES trades:    0")
+    print(f"  NO  trades:  {no_trades:3d}   wins: {no_wins:3d}   "
+          f"({no_wins/no_trades*100:.0f}%)" if no_trades else "  NO  trades:    0")
+    print(f"  TOTAL:       {total_trades:3d}   wins: {total_wins:3d}   "
+          f"({total_wins/total_trades*100:.1f}%)" if total_trades else "  TOTAL:         0")
+    print(f"{'─'*65}")
+    if total_trades:
+        avg_pnl = total_pnl / total_trades
+        trades_per_day = total_trades / 6.6
+        print(f"  Avg P&L/trade:    ${avg_pnl:+.4f}")
+        print(f"  Trades/day:       {trades_per_day:.1f}")
+        print(f"  Est. P&L/day:     ${avg_pnl * trades_per_day:+.2f}")
+    print(f"  Starting capital: ${capital:.2f}")
+    print(f"  Final cash:       ${cash:.2f}")
+    print(f"  Total P&L:        ${cash - capital:+.2f}  ({(cash/capital - 1)*100:+.1f}%)")
+    entry_be = entry_min + polymarket_taker_fee_amount(entry_min, 1)
+    print(f"\n  Break-even win rate at {entry_min:.0%} entry: {entry_be:.1%}")
+    print(f"  (need true prob > {entry_be:.1%} to profit per trade)")
+    print(f"{'='*65}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RESOLVER: Directional taker — buy near expiry at extreme prices
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def run_resolver():
+    """
+    Directional resolver bot.
+
+    Waits for Polymarket YES price to enter extreme range (default 80–95¢)
+    with < 90 seconds to expiry and BTC momentum confirming direction, then
+    places a one-sided TAKER BUY and holds to resolution.
+
+    Edge: captures market mispricing (~5¢) rather than spread (0.37¢).
+    Gas ($0.005) is <1% of trade value vs 2,700% for market making at $15.
+
+    Env config:
+        RESOLVER_MIN_PRICE=0.80
+        RESOLVER_MAX_PRICE=0.95
+        RESOLVER_MAX_TTE=90
+        PAPER_TRADING=true/false
+    """
+    if not HAS_HL_FEED:
+        print("ERROR: hyperliquid_api.py not found."); return
+
+    entry_min  = float(os.getenv("RESOLVER_MIN_PRICE", "0.80"))
+    entry_max  = float(os.getenv("RESOLVER_MAX_PRICE", "0.95"))
+    max_tte    = float(os.getenv("RESOLVER_MAX_TTE",   "120"))
+    paper_mode = os.getenv("PAPER_TRADING", "true").lower() != "false"
+    capital    = float(os.getenv("INITIAL_CAPITAL", "100"))
+
+    hl_feed       = HyperliquidFeed(poll_interval=3.0)
+    btc_feed      = BinanceBTCFeed()      if HAS_BINANCE_FEED   else None
+    gamma_feed    = PolymarketGammaFeed() if HAS_GAMMA_FEED     else None
+    chainlink_feed= ChainlinkBTCFeed()    if HAS_CHAINLINK_FEED else None
+    confidence_calc = ConfidenceCalculator(max_inventory=15.0)
+    data_loader   = HistoricalDataLoader()   # records every tick for backtest
+    alerter       = AlertManager.from_env()
+
+    manager = None
+    if not paper_mode:
+        if not HAS_LIVE_TRADER:
+            print("ERROR: LiveOrderManager not available (install py-clob-client)."); return
+        manager = LiveOrderManager()
+
+    print(f"""
+╔══════════════════════════════════════════════════════════════╗
+║  DIRECTIONAL RESOLVER                                        ║
+║  {'PAPER MODE — no real funds' if paper_mode else '⚠  LIVE MODE — REAL FUNDS ON POLYGON ⚠ '}{'                 ' if paper_mode else ''}║
+║                                                              ║
+║  Strategy: buy YES at {entry_min:.0%}–{entry_max:.0%} when TTE < {max_tte:.0f}s           ║
+║  Capital:  ${capital:<10.2f}                                   ║
+║  Press Ctrl+C to stop                                        ║
+╚══════════════════════════════════════════════════════════════╝
+    """)
+
+    start_tasks = [hl_feed.start()]
+    if btc_feed:      start_tasks.append(btc_feed.start())
+    if gamma_feed:    start_tasks.append(gamma_feed.start())
+    if chainlink_feed:start_tasks.append(chainlink_feed.start())
+    if manager:       start_tasks.append(manager.start())
+    await asyncio.gather(*start_tasks)
+    await asyncio.sleep(10)  # let feeds connect
+
+    # ── State ─────────────────────────────────────────────────────────────────
+    cash          = capital
+    _in_position  = False
+    _trade_dir    = "YES"   # "YES" or "NO"
+    _entry_price  = 0.0
+    _entry_size   = 0.0
+    _entry_fee    = 0.0
+    _entry_market = ""
+    _prev_tte     = 999.0
+    total_trades  = 0
+    wins = losses = 0
+    total_pnl     = 0.0
+    cycle         = 0
+
+    logger.info(f"Resolver started  paper={paper_mode}  capital=${capital:.2f}")
+
+    try:
+        while True:
+            hl_fields    = hl_feed.get_snapshot_fields()
+            btc_fields   = btc_feed.get_snapshot_fields()   if btc_feed      else {}
+            gamma_fields = gamma_feed.get_snapshot_fields() if gamma_feed     else {}
+            cl_fields    = chainlink_feed.get_snapshot_fields() if chainlink_feed else {}
+
+            if chainlink_feed and btc_feed and btc_feed.price:
+                chainlink_feed.binance_price = btc_feed.price
+
+            snapshot = SideDataSnapshot(
+                btc_price        = btc_fields.get("btc_price") or hl_fields["hl_oracle_price"],
+                btc_change_1m    = btc_fields.get("btc_change_1m", 0.0),
+                btc_change_5m    = btc_fields.get("btc_change_5m", 0.0),
+                btc_volatility_1m= btc_fields.get("btc_volatility_1m", 0.001),
+                hl_oracle_price  = hl_fields["hl_oracle_price"],
+                hl_funding_rate  = hl_fields["hl_funding_rate"],
+                hl_open_interest = hl_fields["hl_open_interest"],
+                cvd_signal       = hl_fields["cvd_signal"],
+                liq_signal       = hl_fields["liq_signal"],
+                funding_signal   = hl_fields["funding_signal"],
+                oi_signal        = hl_fields["oi_signal"],
+                chainlink_price  = cl_fields.get("chainlink_price", 0.0),
+                market_spread    = gamma_fields.get("market_spread", 0.0),
+                market_best_bid  = gamma_feed.best_bid  if gamma_feed else 0.0,
+                market_best_ask  = gamma_feed.best_ask  if gamma_feed else 1.0,
+                seconds_to_expiry= gamma_fields.get("seconds_to_expiry", 300.0),
+                timestamp        = time.time(),
+            )
+
+            # Record every tick — this is how we build the historical dataset
+            data_loader.record_tick(snapshot)
+
+            feed_timestamps = {
+                "binance":     time.time() if (btc_feed and btc_feed.is_connected) else 0.0,
+                "hyperliquid": time.time() if hl_feed.is_connected else 0.0,
+                "gamma":       time.time() if (gamma_feed and gamma_feed.is_fresh) else 0.0,
+                "chainlink":   (chainlink_feed._last_update if chainlink_feed else 0.0),
+            }
+
+            confidence = confidence_calc.score(
+                snapshot,
+                net_inventory  = 1.0 if _in_position else 0.0,
+                feed_timestamps= feed_timestamps,
+                consecutive_losses = losses,
+            )
+
+            market_bid = snapshot.market_best_bid
+            market_ask = snapshot.market_best_ask
+            market_mid = (market_bid + market_ask) / 2 if market_bid > 0 else 0.0
+            tte        = snapshot.seconds_to_expiry
+
+            # ── Detect market expiry (TTE reset = new window) ─────────────────
+            if _in_position and tte > _prev_tte + 10:
+                # Market rolled over — infer resolution from last mid price
+                # YES wins if last mid > 0.5, NO wins if last mid < 0.5
+                yes_won = market_mid > 0.5 if market_mid > 0 else True
+                if _trade_dir == "YES":
+                    resolution_price = 1.0 if yes_won else 0.0
+                else:
+                    resolution_price = 1.0 if not yes_won else 0.0
+                gross   = resolution_price * _entry_size
+                pnl     = gross - (_entry_price * _entry_size + _entry_fee)
+                cash   += gross
+                total_pnl += pnl
+                total_trades += 1
+                wins   += 1 if pnl > 0 else 0
+                losses += 1 if pnl <= 0 else 0
+                _in_position = False
+                logger.info(
+                    f"RESOLVER EXIT (expiry rollover)  resolve@{resolution_price:.2f}  "
+                    f"pnl=${pnl:+.4f}  cash=${cash:.2f}"
+                )
+                if alerter.enabled:
+                    await alerter.send(
+                        f"{'✅' if pnl>0 else '❌'} <b>Resolver closed</b>  "
+                        f"Pnl: ${pnl:+.4f}  Cash: ${cash:.2f}"
+                    )
+
+            _prev_tte = tte
+
+            # ── Entry gate ────────────────────────────────────────────────────
+            if not _in_position and market_mid > 0:
+                tte_ok    = tte <= max_tte
+                conf_ok   = confidence.tier in ("FULL", "REDUCED")
+                warmed_up = abs(snapshot.btc_change_5m) > 0  # feeds ready
+
+                # Check BOTH directions
+                yes_signal = (entry_min <= market_mid <= entry_max
+                              and snapshot.btc_change_1m >= 0)   # BTC rising → YES
+                no_signal  = ((1 - entry_max) <= market_mid <= (1 - entry_min)
+                              and snapshot.btc_change_1m <= 0)   # BTC falling → NO
+
+                in_range = yes_signal or no_signal
+                # Which direction wins?
+                trade_direction = "YES" if yes_signal else "NO"
+
+                if cycle % 10 == 0:
+                    no_mid = round(1.0 - market_mid, 3) if market_mid > 0 else 0.0
+                    waiting_for = []
+                    if not tte_ok:
+                        waiting_for.append(f"TTE<{max_tte:.0f}s (now {tte:.0f}s)")
+                    if not in_range:
+                        waiting_for.append(f"price 80-95¢ (now YES={market_mid:.0%} NO={no_mid:.0%})")
+                    if not conf_ok:
+                        waiting_for.append(f"confidence (now {confidence.tier})")
+                    status = "WAITING for: " + ", ".join(waiting_for) if waiting_for else "READY TO TRADE"
+                    logger.info(
+                        f"[RESOLVER]  YES={market_mid*100:.1f}¢  NO={no_mid*100:.1f}¢  "
+                        f"TTE={tte:.0f}s  BTC1m={snapshot.btc_change_1m*100:+.3f}%  "
+                        f"conf={confidence.tier}  |  {status}"
+                    )
+
+                if warmed_up and in_range and tte_ok and conf_ok:
+                    # ── SIZE ──────────────────────────────────────────────────
+                    if trade_direction == "YES":
+                        fill_price = market_ask                       # buy YES at ask
+                        token_id   = gamma_feed.yes_token_id if gamma_feed else None
+                    else:
+                        fill_price = round(1.0 - market_bid, 4)      # buy NO ≈ 1 - YES_bid
+                        token_id   = gamma_feed.no_token_id  if gamma_feed else None
+
+                    position_size = min(10.0, cash * 0.05 / fill_price)
+                    position_size = max(0.1, round(position_size, 2))
+                    fee           = polymarket_taker_fee_amount(fill_price, position_size)
+                    cost          = fill_price * position_size + fee
+
+                    if cost <= cash:
+                        if paper_mode:
+                            cash -= cost
+                            _in_position  = True
+                            _trade_dir    = trade_direction
+                            _entry_price  = fill_price
+                            _entry_size   = position_size
+                            _entry_fee    = fee
+                            _entry_market = (gamma_feed._condition_id or "") if gamma_feed else ""
+                            logger.info(
+                                f"RESOLVER ENTRY (paper)  buy {trade_direction} @ {fill_price:.4f}  "
+                                f"size={position_size:.2f}  fee=${fee:.4f}  "
+                                f"tte={tte:.0f}s  mid={market_mid:.3f}  "
+                                f"btc1m={snapshot.btc_change_1m*100:+.3f}%"
+                            )
+                        else:
+                            # Live: taker BUY via CLOB
+                            mid_id = (gamma_feed._condition_id or "") if gamma_feed else ""
+                            if token_id:
+                                order_id = await manager._post_order(
+                                    token_id, fill_price, position_size, "BUY", mid_id
+                                )
+                                if order_id:
+                                    cash -= cost
+                                    _in_position  = True
+                                    _trade_dir    = trade_direction
+                                    _entry_price  = fill_price
+                                    _entry_size   = position_size
+                                    _entry_fee    = fee
+                                    _entry_market = mid_id
+                                    logger.info(
+                                        f"RESOLVER ENTRY (live)  buy {trade_direction} @ {fill_price:.4f}  "
+                                        f"size={position_size:.2f}  fee=${fee:.4f}  "
+                                        f"order_id={order_id}"
+                                    )
+                        if _in_position and alerter.enabled:
+                            await alerter.send(
+                                f"🎯 <b>Resolver entry</b>  "
+                                f"{'Paper' if paper_mode else 'LIVE'}\n"
+                                f"Buy {trade_direction} @ {fill_price*100:.1f}¢  size={position_size:.2f}sh\n"
+                                f"TTE: {tte:.0f}s  BTC 1m: {snapshot.btc_change_1m*100:+.3f}%\n"
+                                f"Cash after: ${cash:.2f}"
+                            )
+
+            # ── Status log every 60 cycles ────────────────────────────────────
+            if cycle % 60 == 0:
+                no_price = round(1.0 - market_mid, 3) if market_mid > 0 else 0.0
+                pos_str = f"IN {_trade_dir} @ {_entry_price:.2f}" if _in_position else "flat"
+                logger.info(
+                    f"[STATUS]  cash=${cash:.2f}  pnl=${total_pnl:+.4f}  trades={total_trades}  "
+                    f"W/L={wins}/{losses}  position={pos_str}  |  "
+                    f"YES={market_mid*100:.1f}¢  NO={no_price*100:.1f}¢  TTE={tte:.0f}s"
+                )
+
+            cycle += 1
+            await asyncio.sleep(1)
+
+    except KeyboardInterrupt:
+        logger.info("Resolver stopped by user")
+    finally:
+        if manager:
+            await manager.stop()
+        stop_tasks = [hl_feed.stop()]
+        if btc_feed:       stop_tasks.append(btc_feed.stop())
+        if gamma_feed:     stop_tasks.append(gamma_feed.stop())
+        if chainlink_feed: stop_tasks.append(chainlink_feed.stop())
+        await asyncio.gather(*stop_tasks)
+
+        print(f"\n{'='*50}")
+        print(f"RESOLVER SESSION SUMMARY")
+        print(f"  Trades:    {total_trades}  (W:{wins} / L:{losses})")
+        if total_trades:
+            print(f"  Win rate:  {wins/total_trades*100:.1f}%")
+            print(f"  Avg P&L:   ${total_pnl/total_trades:+.4f}/trade")
+        print(f"  Total P&L: ${total_pnl:+.4f}")
+        print(f"  Final cash: ${cash:.2f}  (started ${capital:.2f})")
+        print(f"{'='*50}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Market Maker + Backtester")
     parser.add_argument("--backtest", action="store_true",
                         help="Run parameter sweep backtester (synthetic data)")
     parser.add_argument("--realtest", action="store_true",
                         help="Run real data backtest using mm_historical.jsonl")
+    parser.add_argument("--resolver-test", action="store_true",
+                        help="Backtest directional resolver on real historical data")
+    parser.add_argument("--resolver", action="store_true",
+                        help="Directional resolver: buy YES near expiry at extreme prices")
     parser.add_argument("--signals", action="store_true",
                         help="Run live signal monitor (connects to Hyperliquid)")
     parser.add_argument("--paper", action="store_true",
@@ -2173,6 +2630,10 @@ def main():
     if args.backtest:
         from backtests.backtest_unified import run_unified_backtest
         run_unified_backtest()
+    elif getattr(args, "resolver_test", False):
+        run_resolver_backtest()
+    elif args.resolver:
+        asyncio.run(run_resolver())
     elif args.realtest:
         # Run three real data backtest configurations
         backtester = RealDataBacktester()
@@ -2207,11 +2668,13 @@ def main():
 ║                                                              ║
 ║  Available modes:                                            ║
 ║                                                              ║
-║    --paper      Paper trader — no real funds                 ║
-║    --live       Live trading via CLOB (REAL FUNDS)           ║
-║    --dual       Live trading + SharedPositionLock            ║
-║    --signals    Signal monitor only (no trading)             ║
-║    --backtest   Parameter sweep backtester                   ║
+║    --resolver        Directional resolver (paper/live)       ║
+║    --resolver-test   Backtest resolver on real data          ║
+║    --paper           Market maker paper trader               ║
+║    --live            Market maker live (REAL FUNDS)          ║
+║    --dual            Live + SharedPositionLock               ║
+║    --signals         Signal monitor only                     ║
+║    --backtest        Synthetic parameter sweep               ║
 ║                                                              ║
 ║  Dashboard (run in separate terminal):                       ║
 ║    python mm_dashboard.py            Terminal UI (rich)      ║
