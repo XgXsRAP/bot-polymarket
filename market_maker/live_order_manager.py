@@ -160,6 +160,8 @@ class LiveOrderManager:
 
     async def start(self) -> None:
         """Start the background WebSocket fill listener."""
+        if self._client:
+            await self._cancel_orphaned_orders()
         if HAS_WEBSOCKETS and self._client:
             self._ws_task = asyncio.create_task(
                 self._ws_fill_listener(), name="clob_ws_fill_listener"
@@ -167,6 +169,40 @@ class LiveOrderManager:
             logger.info("LiveOrderManager: WS fill listener started")
         else:
             logger.info("LiveOrderManager: running without WS (REST-only fill detection)")
+
+    async def _cancel_orphaned_orders(self) -> None:
+        """Cancel any open orders left from a previous session crash."""
+        try:
+            loop = asyncio.get_event_loop()
+            open_orders = await loop.run_in_executor(None, self._client.get_open_orders)
+            if not open_orders:
+                logger.info("LiveOrderManager: no orphaned orders at startup")
+                return
+            ids = [
+                o.get("id") or o.get("orderID")
+                for o in open_orders
+                if o.get("id") or o.get("orderID")
+            ]
+            if ids:
+                await loop.run_in_executor(None, self._client.cancel_orders, ids)
+                logger.info(f"LiveOrderManager: cancelled {len(ids)} orphaned order(s) at startup")
+        except Exception as exc:
+            logger.warning(f"LiveOrderManager: orphaned order scan failed: {exc}")
+
+    async def _check_balance(self, required_usdc: float) -> bool:
+        """Return True if wallet USDC >= required. Non-blocking — returns True on error."""
+        try:
+            loop = asyncio.get_event_loop()
+            balance = await loop.run_in_executor(None, self._client.get_balance)
+            usdc = float(balance.get("USDC", balance.get("usdc", 0)))
+            if usdc < required_usdc:
+                logger.warning(
+                    f"LiveOrderManager: insufficient balance ${usdc:.2f} < ${required_usdc:.2f} required"
+                )
+                return False
+            return True
+        except Exception:
+            return True  # never block trading on a failed balance check
 
     async def stop(self) -> None:
         """Cancel all open orders then tear down the WS connection."""
@@ -237,6 +273,10 @@ class LiveOrderManager:
             await self._cancel_open_quotes()
             return fills
 
+        # Balance guard: skip if wallet can't cover both sides
+        if not await self._check_balance(size * (yes_bid + yes_ask)):
+            return fills
+
         # Cancel → Replace
         await self._cancel_open_quotes()
         await self._post_order(yes_token_id, yes_bid, size, "BUY",  market_id)
@@ -272,9 +312,25 @@ class LiveOrderManager:
 
         try:
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, self._client.create_and_post_order, order_args
-            )
+            result = None
+            last_exc: Exception | None = None
+            for attempt in range(2):
+                try:
+                    result = await loop.run_in_executor(
+                        None, self._client.create_and_post_order, order_args
+                    )
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    exc_str = str(exc)
+                    if attempt == 0 and not any(c in exc_str for c in ("400", "422", "invalid")):
+                        logger.debug(f"LiveOrderManager: POST {side} attempt 1 failed ({exc}), retrying…")
+                        await asyncio.sleep(1.0)
+                    else:
+                        raise
+            if result is None:
+                raise last_exc  # type: ignore[misc]
+
             order_id = result.get("orderID") or result.get("order_id") or ""
             if not order_id:
                 logger.warning(f"LiveOrderManager: POST {side} returned no orderID: {result}")
