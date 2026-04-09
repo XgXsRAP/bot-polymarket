@@ -179,7 +179,7 @@ The price detection system needs a complete rewrite of the update path:
 
 ## 5. TODO List (Prioritized)
 
-### Phase 1: Fix Price Detection (URGENT — Do First)
+### Phase 1: Fix Price Detection FIXED-UPDATED 4.8.26
 
 -FIXED [ ] **T1.1** Rewrite `_handle_book_msg()` in `polymarket_gamma.py`:
   - Handle size=0 events by resetting bid/ask and requesting a full book snapshot
