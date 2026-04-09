@@ -29,6 +29,7 @@ except ImportError:
     HAS_WEBSOCKETS = False
 
 _GAMMA_BASE = "https://gamma-api.polymarket.com"
+_CLOB_BASE = "https://clob.polymarket.com"
 _WINDOW = 300  # 5-minute markets
 
 
@@ -89,6 +90,8 @@ class PolymarketGammaFeed:
         # CLOB WebSocket state
         self._ws_task: asyncio.Task | None = None
         self._subscribed_cid: str | None = None  # cid currently subscribed on the WS
+        self._ws_unavailable: bool = False        # True when WS fails (HTTP auth errors)
+        self._needs_book_refresh: bool = False    # True when size=0 removal hits our best
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -135,41 +138,75 @@ class PolymarketGammaFeed:
 
     async def _clob_book_loop(self):
         """
-        Fast Gamma price poll every 3 seconds using the prices endpoint.
-        Updates best_bid/best_ask from outcomePrices + spread without
-        waiting for the full 10-second REST poll cycle.
+        Fast price poll using the CLOB REST orderbook endpoint.
+        Uses GET /book?token_id={yes_token_id} for real bid/ask (not Gamma cache).
+        Polls every 2s normally, drops to 1s when WS is unavailable or a book
+        refresh is needed (size=0 removal hit our best price).
         """
         while self._running:
-            await asyncio.sleep(3)
-            if not self._market_id:
+            interval = 1.0 if (self._ws_unavailable or self._needs_book_refresh) else 2.0
+            await asyncio.sleep(interval)
+            token_id = self._yes_token_id
+            if not token_id:
                 continue
             try:
                 session = self._session or aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=5)
                 )
-                # GET /markets/{numeric_id} — fastest per-market price endpoint
+                # Primary: CLOB orderbook — real live book, not cached
                 async with session.get(
-                    f"{_GAMMA_BASE}/markets/{self._market_id}",
+                    f"{_CLOB_BASE}/book",
+                    params={"token_id": token_id},
                 ) as resp:
                     if resp.status != 200:
+                        # Fallback to Gamma API if CLOB book unavailable
+                        await self._gamma_price_fallback(session)
                         continue
                     data = await resp.json()
-                    best_bid = data.get("bestBid")
-                    best_ask = data.get("bestAsk")
-                    prices   = data.get("outcomePrices") or []
-                    spread   = float(data.get("spread") or 0.01)
-
-                    if best_bid is not None and best_ask is not None:
-                        self._best_bid = float(best_bid)
-                        self._best_ask = float(best_ask)
-                        self._last_update = time.time()
-                    elif prices:
-                        mid = float(prices[0])
-                        self._best_bid = max(0.01, mid - spread / 2)
-                        self._best_ask = min(0.99, mid + spread / 2)
-                        self._last_update = time.time()
+                    bids = data.get("bids") or []
+                    asks = data.get("asks") or []
+                    if bids:
+                        self._best_bid = float(bids[0]["price"])
+                    elif not bids:
+                        self._best_bid = 0.0
+                    if asks:
+                        self._best_ask = float(asks[0]["price"])
+                    elif not asks:
+                        self._best_ask = 1.0
+                    self._last_update = time.time()
+                    self._needs_book_refresh = False
             except Exception as e:
-                logger.debug(f"Fast price poll error: {e}")
+                logger.warning(f"CLOB book poll error: {e}")
+                # Fallback to Gamma on CLOB failure
+                try:
+                    await self._gamma_price_fallback(session)
+                except Exception:
+                    pass
+
+    async def _gamma_price_fallback(self, session: aiohttp.ClientSession):
+        """Fallback: poll Gamma API for prices when CLOB book is unavailable."""
+        if not self._market_id:
+            return
+        async with session.get(
+            f"{_GAMMA_BASE}/markets/{self._market_id}",
+        ) as resp:
+            if resp.status != 200:
+                return
+            data = await resp.json()
+            best_bid = data.get("bestBid")
+            best_ask = data.get("bestAsk")
+            prices = data.get("outcomePrices") or []
+            spread = float(data.get("spread") or 0.01)
+
+            if best_bid is not None and best_ask is not None:
+                self._best_bid = float(best_bid)
+                self._best_ask = float(best_ask)
+                self._last_update = time.time()
+            elif prices:
+                mid = float(prices[0])
+                self._best_bid = max(0.01, mid - spread / 2)
+                self._best_ask = min(0.99, mid + spread / 2)
+                self._last_update = time.time()
 
     # ── CLOB WebSocket ─────────────────────────────────────────────────────────
 
@@ -208,14 +245,17 @@ class PolymarketGammaFeed:
             except Exception as exc:
                 self._subscribed_cid = None
                 exc_str = str(exc)
-                # HTTP 404/401/403 = endpoint unavailable without auth credentials.
-                # No point retrying — fall back to REST-only bid/ask (10s polls).
+                # HTTP 404/401/403 = endpoint may require auth credentials.
+                # Don't exit permanently — retry after longer backoff. REST polling
+                # runs at 1s interval while WS is down to compensate.
                 if any(f"HTTP {c}" in exc_str for c in ("404", "401", "403")):
-                    logger.info(
-                        "PolymarketGamma WS: book channel unavailable without CLOB "
-                        "credentials (HTTP error) — using REST-only bid/ask updates."
+                    self._ws_unavailable = True
+                    logger.warning(
+                        "PolymarketGamma WS: book channel HTTP error — "
+                        "using fast REST polling (1s). Will retry WS in 60s."
                     )
-                    return
+                    await asyncio.sleep(60)
+                    continue
                 logger.warning(
                     f"PolymarketGamma WS: disconnected ({exc}); reconnecting in 5s"
                 )
@@ -235,27 +275,36 @@ class PolymarketGammaFeed:
                     sells = msg.get("sells") or []
                     if buys:
                         self._best_bid = float(buys[0]["price"])
+                    else:
+                        self._best_bid = 0.0
                     if sells:
                         self._best_ask = float(sells[0]["price"])
-                    if buys or sells:
-                        self._last_update = time.time()
+                    else:
+                        self._best_ask = 1.0
+                    self._last_update = time.time()
+                    self._needs_book_refresh = False
                 elif etype == "price_change":
-                    # Incremental update: raise top bid or lower top ask on new levels;
-                    # removals (size==0) of the current top are left for REST poll to correct
                     for change in msg.get("changes") or []:
                         side = change.get("side", "").lower()
                         price = float(change.get("price", 0))
                         size = float(change.get("size", 0))
                         if size == 0:
-                            continue  # level removed — REST poll will correct within 10s
-                        if side == "buy" and price > self._best_bid:
+                            # Order removed — if it was our best level, flag for
+                            # immediate REST refresh instead of waiting 10s
+                            if side == "buy" and abs(price - self._best_bid) < 0.0001:
+                                self._needs_book_refresh = True
+                            elif side == "sell" and abs(price - self._best_ask) < 0.0001:
+                                self._needs_book_refresh = True
+                            continue
+                        # Update in BOTH directions (not just tighter)
+                        if side == "buy" and price >= self._best_bid:
                             self._best_bid = price
                             self._last_update = time.time()
-                        elif side == "sell" and (self._best_ask <= 0 or price < self._best_ask):
+                        elif side == "sell" and (self._best_ask >= 1.0 or price <= self._best_ask):
                             self._best_ask = price
                             self._last_update = time.time()
         except Exception as exc:
-            logger.debug(f"PolymarketGamma WS parse error: {exc}")
+            logger.warning(f"PolymarketGamma WS parse error: {exc}")
 
     async def _fetch_current(self):
         """Fetch the current 5-min window market using its deterministic slug."""
@@ -282,12 +331,12 @@ class PolymarketGammaFeed:
         # Log only once when we first fall back to cached data
         if self._condition_id and not self._using_cached_market:
             self._using_cached_market = True
-            logger.debug(
+            logger.warning(
                 f"Gamma: using cached market {(self._condition_id or '')[:16]}… "
                 f"(slug miss #{self._slug_miss_count})"
             )
         elif not self._condition_id:
-            logger.debug("Gamma: no active 5-min BTC market found for current window")
+            logger.warning("Gamma: no active 5-min BTC market found for current window")
 
     async def _fetch_by_slug(self, slug: str) -> dict | None:
         """Query GET /events?slug=<slug> and return the first market inside."""
@@ -319,7 +368,7 @@ class PolymarketGammaFeed:
             return market
 
         except Exception as e:
-            logger.debug(f"Gamma fetch error for slug {slug}: {e}")
+            logger.warning(f"Gamma fetch error for slug {slug}: {e}")
             return None
 
     async def _fetch_by_tag_search(self) -> dict | None:
@@ -354,15 +403,25 @@ class PolymarketGammaFeed:
                 return market
 
         except Exception as e:
-            logger.debug(f"Gamma tag-fallback error: {e}")
+            logger.warning(f"Gamma tag-fallback error: {e}")
         return None
 
     # ── Parsing ───────────────────────────────────────────────────────────────
 
     def _parse(self, market: dict, slug: str):
+        new_cid = market.get("conditionId") or market.get("id")
+        # Reset stale prices when market window rotates to a new condition
+        if new_cid != self._condition_id and self._condition_id is not None:
+            self._best_bid = 0.0
+            self._best_ask = 1.0
+            self._needs_book_refresh = True
+            logger.info(
+                f"Gamma: new market window, reset prices "
+                f"(old={self._condition_id[:12] if self._condition_id else 'none'})"
+            )
         self._using_cached_market = False
-        self._condition_id = market.get("conditionId") or market.get("id")
-        self._market_id = str(market.get("id") or "")   # numeric id for fast REST polling
+        self._condition_id = new_cid
+        self._market_id = str(market.get("id") or "")   # numeric id for Gamma fallback
         self._last_slug = slug
 
         # Use event-level endDate (most reliable)
@@ -450,8 +509,23 @@ class PolymarketGammaFeed:
         return self._no_token_id
 
     @property
+    def price_age(self) -> float:
+        """Seconds since last price update. 999 if never updated."""
+        return time.time() - self._last_update if self._last_update > 0 else 999.0
+
+    @property
     def is_fresh(self) -> bool:
-        return (time.time() - self._last_update) < 30.0
+        return self.price_age < 30.0
+
+    @property
+    def is_tradeable(self) -> bool:
+        """Prices are fresh enough and confirmed for the current market."""
+        return (
+            self.price_age < 10.0
+            and self._best_bid > 0.0
+            and self._best_ask < 1.0
+            and not self._using_cached_market
+        )
 
     def get_snapshot_fields(self) -> dict:
         return {
@@ -467,7 +541,10 @@ class PolymarketGammaFeed:
             "best_ask": f"{self._best_ask:.4f}",
             "spread": f"{self.market_spread:.4f}",
             "seconds_to_expiry": f"{self.seconds_to_expiry:.0f}s",
+            "price_age": f"{self.price_age:.1f}s",
             "fresh": self.is_fresh,
+            "tradeable": self.is_tradeable,
+            "ws_available": not self._ws_unavailable,
             "cached": self._using_cached_market,
             "slug_misses": self._slug_miss_count,
         }
