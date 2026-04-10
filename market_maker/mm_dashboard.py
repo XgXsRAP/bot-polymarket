@@ -244,129 +244,340 @@ WEB_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BTC Market Maker</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #0d1117; color: #e6edf3; font-family: 'Courier New', monospace; font-size: 13px; padding: 16px; }
-  h1 { color: #e6edf3; border-bottom: 1px solid #30363d; padding-bottom: 8px; margin-bottom: 16px; font-size: 15px; letter-spacing: 1px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
-  .card { background: #161b22; border: 1px solid #21262d; padding: 10px 14px; }
-  .card h2 { color: #8b949e; font-size: 10px; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px; border-bottom: 1px solid #21262d; padding-bottom: 4px; }
-  .big { font-size: 24px; font-weight: bold; color: #f0f6fc; }
-  .green { color: #3fb950; } .red { color: #f85149; } .yellow { color: #d29922; } .dim { color: #8b949e; }
-  .row { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid #21262d; font-size: 12px; }
-  .row:last-child { border: none; }
-  .full { grid-column: 1 / -1; }
-  .bar-bg { background: #21262d; height: 8px; margin: 6px 0; }
-  .bar-fg { height: 8px; }
-  .expiry-bg { background: #21262d; height: 14px; position: relative; margin: 6px 0; }
-  .expiry-fg { height: 14px; }
-  .expiry-label { position: absolute; top: 0; left: 50%; transform: translateX(-50%); line-height: 14px; font-size: 11px; }
-  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
-  .stat { }
-  .stat .label { color: #8b949e; font-size: 10px; margin-bottom: 2px; }
-  .stat .val { font-size: 16px; font-weight: bold; }
-  pre { font-family: inherit; font-size: 12px; color: #8b949e; }
+  :root {
+    --bg: #f4f6f8;
+    --panel: #ffffff;
+    --text: #16202a;
+    --muted: #6b7785;
+    --line: #d8e0e7;
+    --green: #1a9c5f;
+    --red: #d24d57;
+    --yellow: #c58a12;
+    --blue: #276ef1;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 20px;
+  }
+  .shell { max-width: 1080px; margin: 0 auto; }
+  .topbar {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-end;
+    margin-bottom: 18px;
+  }
+  .title {
+    font-size: 28px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .subtitle, .refresh-note { color: var(--muted); font-size: 14px; }
+  .hero {
+    background: linear-gradient(135deg, #ffffff 0%, #eef4fb 100%);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 8px 24px rgba(16, 24, 40, 0.06);
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr 1fr;
+    gap: 14px;
+    align-items: end;
+  }
+  .eyebrow {
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+  }
+  .price {
+    font-size: 42px;
+    font-weight: 800;
+    line-height: 1;
+  }
+  .metric {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px;
+  }
+  .metric-value {
+    font-size: 24px;
+    font-weight: 700;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 18px;
+    box-shadow: 0 8px 24px rgba(16, 24, 40, 0.04);
+  }
+  .card h2 {
+    margin: 0 0 14px 0;
+    font-size: 16px;
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--line);
+    align-items: center;
+  }
+  .row:last-child { border-bottom: none; padding-bottom: 0; }
+  .label { color: var(--muted); }
+  .value { text-align: right; font-weight: 600; }
+  .muted { color: var(--muted); }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  .yellow { color: var(--yellow); }
+  .blue { color: var(--blue); }
+  .market-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--muted);
+    word-break: break-all;
+    margin-bottom: 14px;
+  }
+  .progress {
+    height: 10px;
+    background: #e8edf2;
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .progress > div {
+    height: 100%;
+    border-radius: 999px;
+  }
+  .mini-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #eef4fb;
+    color: var(--blue);
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .empty {
+    padding: 32px 20px;
+    text-align: center;
+    color: var(--muted);
+    background: var(--panel);
+    border: 1px dashed var(--line);
+    border-radius: 18px;
+  }
+  @media (max-width: 900px) {
+    .hero-grid, .grid { grid-template-columns: 1fr; }
+    .topbar { flex-direction: column; align-items: flex-start; }
+    .price { font-size: 34px; }
+  }
 </style>
 </head>
 <body>
-<h1>BTC 5-MIN MARKET MAKER</h1>
-<div id="app"><pre>Loading...</pre></div>
+<div class="shell">
+  <div class="topbar">
+    <div>
+      <div class="title">BTC Market Maker</div>
+      <div class="subtitle">Simple live view for the paper market maker</div>
+    </div>
+    <div class="refresh-note">Auto-refreshing every second</div>
+  </div>
+  <div id="app" class="empty">Loading dashboard...</div>
+</div>
 <script>
+function asNumber(v, fallback = 0) {
+  return Number.isFinite(Number(v)) ? Number(v) : fallback;
+}
+
+function formatMoney(v) {
+  const n = asNumber(v);
+  const cls = n >= 0 ? 'green' : 'red';
+  const sign = n >= 0 ? '+' : '-';
+  return `<span class="${cls}">${sign}$${Math.abs(n).toFixed(2)}</span>`;
+}
+
+function formatPercentFromDecimal(v) {
+  const n = asNumber(v) * 100;
+  const cls = n >= 0 ? 'green' : 'red';
+  const sign = n >= 0 ? '+' : '';
+  return `<span class="${cls}">${sign}${n.toFixed(3)}%</span>`;
+}
+
+function formatSignal(v) {
+  const n = asNumber(v);
+  const cls = n > 0.1 ? 'green' : n < -0.1 ? 'red' : 'muted';
+  return `<span class="${cls}">${n >= 0 ? '+' : ''}${n.toFixed(3)}</span>`;
+}
+
+function formatCents(v) {
+  return `${Math.round(asNumber(v) * 100)}c`;
+}
+
+function formatTime(ts) {
+  if (!ts) return 'never';
+  const age = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (age < 60) return `${age}s ago`;
+  return `${(age / 60).toFixed(1)}m ago`;
+}
+
+function confidenceColor(conf) {
+  if (conf >= 80) return 'var(--green)';
+  if (conf >= 60) return 'var(--yellow)';
+  if (conf >= 40) return '#ea8c2d';
+  return 'var(--red)';
+}
+
+function expiryColor(exp) {
+  if (exp < 30) return 'var(--red)';
+  if (exp < 60) return 'var(--yellow)';
+  return 'var(--green)';
+}
+
 async function update() {
   try {
-    const r = await fetch('/state');
-    const s = await r.json();
-    const f2 = v => (v||0).toFixed(2);
-    const f3 = v => (v||0).toFixed(3);
-    const cents = v => Math.round((v||0)*100) + 'c';
-    const pnl = v => v >= 0
-      ? '<span class="green">+$' + f2(v) + '</span>'
-      : '<span class="red">-$' + f2(Math.abs(v)) + '</span>';
-    const pct = v => {
-      const x = (v||0)*100;
-      return x >= 0
-        ? '<span class="green">+' + x.toFixed(3) + '%</span>'
-        : '<span class="red">'  + x.toFixed(3) + '%</span>';
-    };
-    const arrow = v => v > 0.1 ? '&#x25B2;' : v < -0.1 ? '&#x25BC;' : '&mdash;';
-    const sigCls = v => v > 0.1 ? 'green' : v < -0.1 ? 'red' : 'dim';
+    const response = await fetch('/state');
+    const s = await response.json();
 
-    const exp = s.seconds_to_expiry || 300;
+    if (!s || !Object.keys(s).length) {
+      document.getElementById('app').className = 'empty';
+      document.getElementById('app').innerHTML = 'Waiting for bot state...';
+      return;
+    }
+
+    const btcPrice = asNumber(s.btc_price);
+    const exp = asNumber(s.seconds_to_expiry, 300);
     const expPct = Math.max(0, Math.min(100, exp / 300 * 100));
-    const expColor = exp < 30 ? '#f85149' : exp < 60 ? '#d29922' : '#3fb950';
-    const mins = Math.floor(exp/60), secs = Math.floor(exp%60);
+    const mins = Math.floor(exp / 60);
+    const secs = Math.floor(exp % 60).toString().padStart(2, '0');
+    const conf = asNumber(s.current_confidence);
+    const rpnl = asNumber(s.realized_pnl);
+    const upnl = asNumber(s.unrealized_pnl);
+    const totalPnl = rpnl + upnl;
+    const trips = asNumber(s.round_trips);
+    const wins = asNumber(s.winning_trips);
+    const winRate = trips > 0 ? ((wins / trips) * 100).toFixed(0) : '0';
+    const inventory = asNumber(s.net_inventory);
 
-    const conf = s.current_confidence || 0;
-    const tier = s.confidence_tier || 'PAUSED';
-    const confColor = conf>=80 ? '#3fb950' : conf>=60 ? '#d29922' : conf>=40 ? '#f0883e' : '#f85149';
-
-    const trips = s.round_trips || 0;
-    const wins  = s.winning_trips || 0;
-    const wr    = trips > 0 ? (wins/trips*100).toFixed(0) : '0';
-    const rpnl  = s.realized_pnl   || 0;
-    const upnl  = s.unrealized_pnl || 0;
-
+    document.getElementById('app').className = '';
     document.getElementById('app').innerHTML = `
-    <div class="grid">
-
-      <div class="card full">
-        <h2>BTC Price</h2>
-        <span class="big">$${(s.btc_price||0).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2})}</span>
-        &nbsp; ${pct(s.btc_change_1m)} 1m &nbsp; ${pct(s.btc_change_5m)} 5m
-        &nbsp; <span class="dim">vol ${f3(s.btc_volatility_1m)}</span>
-      </div>
-
-      <div class="card full">
-        <h2>Active Market</h2>
-        <div class="dim" style="margin-bottom:4px;font-size:12px">${s.market_id || 'Waiting for market...'}</div>
-        <div class="expiry-bg">
-          <div class="expiry-fg" style="width:${expPct}%;background:${expColor}"></div>
-          <div class="expiry-label" style="color:#e6edf3">${mins}m ${secs.toString().padStart(2,'0')}s</div>
+      <section class="hero">
+        <div class="hero-grid">
+          <div>
+            <div class="eyebrow">BTC Price</div>
+            <div class="price">$${btcPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+            <div class="muted" style="margin-top:8px">
+              1m ${formatPercentFromDecimal(s.btc_change_1m)}
+              &nbsp;&nbsp; 5m ${formatPercentFromDecimal(s.btc_change_5m)}
+            </div>
+          </div>
+          <div class="metric">
+            <div class="eyebrow">Confidence</div>
+            <div class="metric-value">${conf.toFixed(0)}%</div>
+            <div class="pill" style="margin-top:8px">${s.confidence_tier || 'PAUSED'}</div>
+          </div>
+          <div class="metric">
+            <div class="eyebrow">Total P&L</div>
+            <div class="metric-value">${formatMoney(totalPnl)}</div>
+            <div class="muted" style="margin-top:8px">Updated ${formatTime(s.last_update)}</div>
+          </div>
+          <div class="metric">
+            <div class="eyebrow">Inventory</div>
+            <div class="metric-value ${inventory === 0 ? 'blue' : inventory > 0 ? 'green' : 'red'}">${inventory.toFixed(0)} sh</div>
+            <div class="muted" style="margin-top:8px">Fills ${asNumber(s.total_fills).toFixed(0)}</div>
+          </div>
         </div>
-      </div>
+      </section>
 
-      <div class="card">
-        <h2>Signals</h2>
-        <div class="row"><span>CVD</span><span class="${sigCls(s.cvd_signal)}">${f3(s.cvd_signal)} ${arrow(s.cvd_signal)}</span></div>
-        <div class="row"><span>Funding</span><span class="${sigCls(s.funding_signal)}">${f3(s.funding_signal)} ${arrow(s.funding_signal)}</span></div>
-        <div class="row"><span>Liq</span><span class="${sigCls(s.liq_signal)}">${f3(s.liq_signal)} ${arrow(s.liq_signal)}</span></div>
-        <div class="row"><span>OI</span><span class="${sigCls(s.oi_signal)}">${f3(s.oi_signal)} ${arrow(s.oi_signal)}</span></div>
-      </div>
-
-      <div class="card">
-        <h2>Quotes &mdash; cents (Polymarket format)</h2>
-        <div class="row"><span>YES BID</span><span class="green">${cents(s.current_yes_bid)}</span><span class="dim">mkt ${cents(s.market_best_bid)}</span></div>
-        <div class="row"><span>YES ASK</span><span class="red">${cents(s.current_yes_ask)}</span><span class="dim">mkt ${cents(s.market_best_ask)}</span></div>
-        <div class="row"><span>Fair Value</span><span>${cents(s.current_fair_value)}</span></div>
-        <div class="row"><span>Spread</span><span class="yellow">${cents(s.current_spread)}</span></div>
-      </div>
-
-      <div class="card full">
-        <h2>Confidence &mdash; ${conf.toFixed(0)}% [${tier}]</h2>
-        <div class="bar-bg"><div class="bar-fg" style="width:${conf}%;background:${confColor}"></div></div>
-        <span class="dim" style="font-size:11px">${s.confidence_reason || ''}</span>
-      </div>
-
-      <div class="card full">
-        <h2>P&L</h2>
-        <div class="stat-grid" style="margin-bottom:8px">
-          <div class="stat"><div class="label">Total P&L</div><div class="val">${pnl(rpnl+upnl)}</div></div>
-          <div class="stat"><div class="label">Realized</div><div class="val">${pnl(rpnl)}</div></div>
-          <div class="stat"><div class="label">Unrealized</div><div class="val">${pnl(upnl)}</div></div>
+      <section class="grid">
+        <div class="card">
+          <h2>Active Market</h2>
+          <div class="market-id">${s.market_id || 'Waiting for market...'}</div>
+          <div class="eyebrow">Time To Expiry</div>
+          <div class="progress">
+            <div style="width:${expPct}%; background:${expiryColor(exp)}"></div>
+          </div>
+          <div class="value" style="text-align:left; margin-bottom:16px">${mins}m ${secs}s remaining</div>
+          <div class="eyebrow">Reason</div>
+          <div class="muted">${s.confidence_reason || 'No reason available'}</div>
         </div>
-        <div class="row"><span class="dim">Fills</span><span>${s.total_fills||0}</span>
-          <span class="dim">Round Trips</span><span>${trips}</span>
-          <span class="dim">Win Rate</span><span>${wr}%</span></div>
-        <div class="row"><span class="dim">Inventory</span><span>${(s.net_inventory||0).toFixed(0)} sh</span>
-          <span class="dim">Max DD</span><span class="red">$${f2(s.max_drawdown)}</span>
-          <span class="dim">Updated</span><span>${s.last_update ? new Date(s.last_update*1000).toLocaleTimeString() : '—'}</span></div>
-      </div>
-    </div>`;
-  } catch(e) {
-    document.getElementById('app').innerHTML = '<pre class="dim">Waiting for bot state...</pre>';
+
+        <div class="card">
+          <h2>Quotes</h2>
+          <div class="row"><div class="label">YES Bid</div><div class="value green">${formatCents(s.current_yes_bid)}</div></div>
+          <div class="row"><div class="label">YES Ask</div><div class="value red">${formatCents(s.current_yes_ask)}</div></div>
+          <div class="row"><div class="label">Fair Value</div><div class="value">${formatCents(s.current_fair_value)}</div></div>
+          <div class="row"><div class="label">Spread</div><div class="value yellow">${formatCents(s.current_spread)}</div></div>
+          <div class="row"><div class="label">Market Best</div><div class="value muted">${formatCents(s.market_best_bid)} / ${formatCents(s.market_best_ask)}</div></div>
+        </div>
+
+        <div class="card">
+          <h2>Signals</h2>
+          <div class="row"><div class="label">CVD</div><div class="value">${formatSignal(s.cvd_signal)}</div></div>
+          <div class="row"><div class="label">Funding</div><div class="value">${formatSignal(s.funding_signal)}</div></div>
+          <div class="row"><div class="label">Liquidation</div><div class="value">${formatSignal(s.liq_signal)}</div></div>
+          <div class="row"><div class="label">Open Interest</div><div class="value">${formatSignal(s.oi_signal)}</div></div>
+          <div class="row"><div class="label">1m Volatility</div><div class="value muted">${asNumber(s.btc_volatility_1m).toFixed(5)}</div></div>
+        </div>
+
+        <div class="card">
+          <h2>Performance</h2>
+          <div class="mini-grid" style="margin-bottom:14px">
+            <div class="metric">
+              <div class="eyebrow">Realized</div>
+              <div class="metric-value">${formatMoney(rpnl)}</div>
+            </div>
+            <div class="metric">
+              <div class="eyebrow">Unrealized</div>
+              <div class="metric-value">${formatMoney(upnl)}</div>
+            </div>
+          </div>
+          <div class="row"><div class="label">Round Trips</div><div class="value">${trips.toFixed(0)}</div></div>
+          <div class="row"><div class="label">Win Rate</div><div class="value">${winRate}%</div></div>
+          <div class="row"><div class="label">Max Drawdown</div><div class="value red">$${asNumber(s.max_drawdown).toFixed(2)}</div></div>
+          <div class="row"><div class="label">Peak Capital</div><div class="value">$${asNumber(s.peak_capital).toFixed(2)}</div></div>
+        </div>
+      </section>
+    `;
+
+    const bar = document.querySelector('.progress > div');
+    if (bar) {
+      bar.style.background = expiryColor(exp);
+    }
+
+    const confidenceBox = document.querySelector('.hero .metric:nth-child(2)');
+    if (confidenceBox) {
+      confidenceBox.style.borderColor = confidenceColor(conf);
+    }
+  } catch (error) {
+    document.getElementById('app').className = 'empty';
+    document.getElementById('app').innerHTML = 'Waiting for bot state...';
   }
 }
+
 update();
 setInterval(update, 1000);
 </script>
