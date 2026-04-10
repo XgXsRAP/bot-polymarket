@@ -24,6 +24,19 @@ REFRESH_RATE = 1.0   # seconds
 WIDTH = 80           # terminal columns
 
 
+# ── ANSI colors ───────────────────────────────────────────────────────────────
+
+R  = "\033[0m"       # reset
+G  = "\033[92m"      # bright green
+GD = "\033[32m"      # dim green
+RD = "\033[91m"      # bright red
+CY = "\033[96m"      # cyan
+YL = "\033[93m"      # yellow
+DM = "\033[2m"       # dim
+BL = "\033[1m"       # bold
+WH = "\033[97m"      # bright white
+
+
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
@@ -74,26 +87,44 @@ SEP = "=" * WIDTH
 DIV = "-" * WIDTH
 
 
+def _sig_color(v: float) -> str:
+    if v > 0.1:  return G
+    if v < -0.1: return RD
+    return DM
+
+def _pnl_color(v: float) -> str:
+    return G if v >= 0 else RD
+
+def _expiry_color(secs: float) -> str:
+    if secs < 30:  return RD
+    if secs < 60:  return YL
+    return G
+
+
 def render(s: dict) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = []
 
     # ── Header ────────────────────────────────────────────────────────────────
     title = "  BTC 5-MIN MARKET MAKER"
-    lines.append(SEP)
+    sep_c  = f"{GD}{SEP}{R}"
+    div_c  = f"{GD}{DIV}{R}"
     padding = WIDTH - len(title) - len(now_str) - 2
-    lines.append(f"{title}{' ' * max(1, padding)}{now_str}  ")
-    lines.append(SEP)
+    lines.append(sep_c)
+    lines.append(f"{BL}{G}{title}{R}{' ' * max(1, padding)}{DM}{now_str}{R}  ")
+    lines.append(sep_c)
 
     # ── BTC price ─────────────────────────────────────────────────────────────
     btc = s.get("btc_price", 0)
     ch1 = s.get("btc_change_1m", 0) * 100
     ch5 = s.get("btc_change_5m", 0) * 100
     vol = s.get("btc_volatility_1m", 0)
-    ch1_str = f"({'+' if ch1 >= 0 else ''}{ch1:.3f}% 1m)"
-    ch5_str = f"({'+' if ch5 >= 0 else ''}{ch5:.3f}% 5m)"
-    lines.append(f"  BTC  ${btc:,.2f}  {ch1_str}  {ch5_str}   vol:{vol:.5f}")
-    lines.append(DIV)
+    ch1_col = G if ch1 >= 0 else RD
+    ch5_col = G if ch5 >= 0 else RD
+    ch1_str = f"{ch1_col}({'+' if ch1 >= 0 else ''}{ch1:.3f}% 1m){R}"
+    ch5_str = f"{ch5_col}({'+' if ch5 >= 0 else ''}{ch5:.3f}% 5m){R}"
+    lines.append(f"  {BL}BTC{R}  {CY}${btc:,.2f}{R}  {ch1_str}  {ch5_str}   {DM}vol:{vol:.5f}{R}")
+    lines.append(div_c)
 
     # ── Active market + expiry ─────────────────────────────────────────────────
     mkt_id = s.get("market_id") or "Waiting for market..."
@@ -101,9 +132,10 @@ def render(s: dict) -> str:
     mins = int(expiry // 60)
     secs = int(expiry % 60)
     eb = _expiry_bar(expiry, 300, 24)
-    lines.append(f"  MARKET  {mkt_id[:62]}")
-    lines.append(f"  EXPIRY  [{eb}]  {mins}m {secs:02d}s remaining")
-    lines.append(DIV)
+    ecol = _expiry_color(expiry)
+    lines.append(f"  {BL}MARKET{R}  {DM}{mkt_id[:62]}{R}")
+    lines.append(f"  {BL}EXPIRY{R}  {ecol}[{eb}]{R}  {ecol}{mins}m {secs:02d}s remaining{R}")
+    lines.append(div_c)
 
     # ── Signals + Quotes (two columns) ────────────────────────────────────────
     cvd  = s.get("cvd_signal",   0)
@@ -115,37 +147,39 @@ def render(s: dict) -> str:
     yes_ask = s.get("current_yes_ask", 0)
     fv      = s.get("current_fair_value", 0.5)
     spread  = s.get("current_spread", 0)
-
-    # market top-of-book (from Gamma feed)
     mbb = s.get("market_best_bid", 0)
     mba = s.get("market_best_ask", 0)
 
-    lines.append(f"  {'SIGNALS':<36}QUOTES (in cents, same as Polymarket)")
+    lines.append(f"  {BL}{'SIGNALS':<36}QUOTES (cents — Polymarket format){R}")
     lines.append(
-        f"  CVD      {cvd:+.3f}  {_arrow(cvd)}  buy/sell flow  "
-        f"  YES BID  {_cents(yes_bid):>4s}  (mkt bid {_cents(mbb):>4s})  <- posting"
+        f"  CVD      {_sig_color(cvd)}{cvd:+.3f}  {_arrow(cvd)}{R}  buy/sell flow  "
+        f"  {BL}YES BID{R}  {G}{_cents(yes_bid):>4s}{R}  {DM}(mkt {_cents(mbb):>4s}){R}  <- posting"
     )
     lines.append(
-        f"  Funding  {fund:+.3f}  {_arrow(fund)}  crowd pos      "
-        f"  YES ASK  {_cents(yes_ask):>4s}  (mkt ask {_cents(mba):>4s})  <- posting"
+        f"  Funding  {_sig_color(fund)}{fund:+.3f}  {_arrow(fund)}{R}  crowd pos      "
+        f"  {BL}YES ASK{R}  {RD}{_cents(yes_ask):>4s}{R}  {DM}(mkt {_cents(mba):>4s}){R}  <- posting"
     )
     lines.append(
-        f"  Liq      {liq:+.3f}  {_arrow(liq)}  liquidations   "
-        f"  Fair Val {_cents(fv):>4s}"
+        f"  Liq      {_sig_color(liq)}{liq:+.3f}  {_arrow(liq)}{R}  liquidations   "
+        f"  Fair Val {CY}{_cents(fv):>4s}{R}"
     )
     lines.append(
-        f"  OI       {oi:+.3f}  {_arrow(oi)}  new money      "
-        f"  Spread   {_cents(spread):>4s}"
+        f"  OI       {_sig_color(oi)}{oi:+.3f}  {_arrow(oi)}{R}  new money      "
+        f"  Spread   {YL}{_cents(spread):>4s}{R}"
     )
-    lines.append(DIV)
+    lines.append(div_c)
 
     # ── Confidence ────────────────────────────────────────────────────────────
     conf   = s.get("current_confidence", 0)
     tier   = s.get("confidence_tier", "PAUSED")
     reason = s.get("confidence_reason", "no data")
     cb = _bar(conf, 24)
-    lines.append(f"  CONFIDENCE  [{cb}]  {conf:.0f}%  [{tier}]  {reason}")
-    lines.append(DIV)
+    tier_col = G if tier == "NORMAL" else (YL if tier in ("CAUTIOUS", "WIDE") else RD)
+    lines.append(
+        f"  {BL}CONFIDENCE{R}  {G}[{cb}]{R}  {conf:.0f}%  "
+        f"{tier_col}[{tier}]{R}  {DM}{reason}{R}"
+    )
+    lines.append(div_c)
 
     # ── P&L ───────────────────────────────────────────────────────────────────
     rpnl  = s.get("realized_pnl", 0)
@@ -160,17 +194,22 @@ def render(s: dict) -> str:
     peak  = s.get("peak_capital", 0)
     updated = _since(s.get("last_update", 0))
 
+    def cpnl(v):
+        c = G if v >= 0 else RD
+        return f"{c}{_pnl(v)}{R}"
+
     lines.append(
-        f"  P&L   {_pnl(tpnl):>10s}  |  Realized {_pnl(rpnl):>10s}  |  Unrealized {_pnl(upnl):>10s}"
+        f"  {BL}P&L{R}   {cpnl(tpnl):>10s}  |  Realized {cpnl(rpnl):>10s}  |  Unrealized {cpnl(upnl):>10s}"
     )
     lines.append(
-        f"  Fills {fills:>7d}       |  Trips  {trips:<7d}        |  Win Rate   {wr:.0f}%"
+        f"  Fills {WH}{fills:>7d}{R}       |  Trips  {WH}{trips:<7d}{R}        |  Win Rate   {WH}{wr:.0f}%{R}"
     )
+    inv_col = RD if abs(inv) > 10 else (YL if abs(inv) > 5 else G)
     lines.append(
-        f"  Inv  {inv:>+7.0f}        |  Max DD ${dd:<8.2f}        |  Peak ${peak:.2f}"
+        f"  Inv  {inv_col}{inv:>+7.0f}{R}        |  Max DD {RD}${dd:<8.2f}{R}        |  Peak {G}${peak:.2f}{R}"
     )
-    lines.append(f"  Updated: {updated}")
-    lines.append(SEP)
+    lines.append(f"  {DM}Updated: {updated}{R}")
+    lines.append(sep_c)
 
     return "\n".join(lines)
 
@@ -184,12 +223,12 @@ def run_terminal():
             sys.stdout.write(CLEAR)
             if not s:
                 sys.stdout.write(
-                    f"{SEP}\n"
-                    f"  BTC 5-MIN MARKET MAKER\n"
-                    f"{SEP}\n"
-                    f"  Waiting for bot state...\n\n"
-                    f"  Run:  source venv/bin/activate && python mm_enhanced1.py --paper\n"
-                    f"{SEP}\n"
+                    f"{GD}{SEP}{R}\n"
+                    f"  {BL}{G}BTC 5-MIN MARKET MAKER{R}\n"
+                    f"{GD}{SEP}{R}\n"
+                    f"  {YL}Waiting for bot state...{R}\n\n"
+                    f"  {DM}Run:  source venv/bin/activate && python mm_enhanced_1.py --paper{R}\n"
+                    f"{GD}{SEP}{R}\n"
                 )
             else:
                 sys.stdout.write(render(s) + "\n")
