@@ -138,10 +138,13 @@ class PolymarketGammaFeed:
 
     async def _clob_book_loop(self):
         """
-        Fast price poll using the CLOB REST orderbook endpoint.
-        Uses GET /book?token_id={yes_token_id} for real bid/ask (not Gamma cache).
-        Polls every 2s normally, drops to 1s when WS is unavailable or a book
-        refresh is needed (size=0 removal hit our best price).
+        Real-time price poll using CLOB /midpoint endpoint (2s interval).
+
+        The CLOB /book endpoint only shows external user orders parked far from
+        fair value (0.01/0.99). Polymarket's internal AMM is NOT visible in the
+        book. The /midpoint endpoint returns the true live AMM-derived price that
+        matches what Polymarket's UI displays — including near-expiry moves to
+        0.99/0.01. Falls back to Gamma API if CLOB midpoint is unavailable.
         """
         while self._running:
             interval = 1.0 if (self._ws_unavailable or self._needs_book_refresh) else 2.0
@@ -153,31 +156,37 @@ class PolymarketGammaFeed:
                 session = self._session or aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=5)
                 )
-                # Primary: CLOB orderbook — real live book, not cached
+                # CLOB /midpoint — AMM-derived real-time price matching Polymarket UI
                 async with session.get(
-                    f"{_CLOB_BASE}/book",
+                    f"{_CLOB_BASE}/midpoint",
                     params={"token_id": token_id},
                 ) as resp:
                     if resp.status != 200:
-                        # Fallback to Gamma API if CLOB book unavailable
                         await self._gamma_price_fallback(session)
                         continue
                     data = await resp.json()
-                    bids = data.get("bids") or []
-                    asks = data.get("asks") or []
-                    if bids:
-                        self._best_bid = float(bids[0]["price"])
-                    elif not bids:
-                        self._best_bid = 0.0
-                    if asks:
-                        self._best_ask = float(asks[0]["price"])
-                    elif not asks:
-                        self._best_ask = 1.0
-                    self._last_update = time.time()
-                    self._needs_book_refresh = False
+                    mid = float(data.get("mid") or 0)
+                    if not (0.01 <= mid <= 0.99):
+                        await self._gamma_price_fallback(session)
+                        continue
+
+                # Get current spread (usually 0.01 but can widen)
+                spread = 0.01
+                async with session.get(
+                    f"{_CLOB_BASE}/spread",
+                    params={"token_id": token_id},
+                ) as resp2:
+                    if resp2.status == 200:
+                        sp_data = await resp2.json()
+                        spread = float(sp_data.get("spread") or 0.01)
+
+                self._best_bid = round(max(0.01, mid - spread / 2), 4)
+                self._best_ask = round(min(0.99, mid + spread / 2), 4)
+                self._last_update = time.time()
+                self._needs_book_refresh = False
+
             except Exception as e:
-                logger.warning(f"CLOB book poll error: {e}")
-                # Fallback to Gamma on CLOB failure
+                logger.debug(f"CLOB midpoint poll error: {e}")
                 try:
                     await self._gamma_price_fallback(session)
                 except Exception:
@@ -447,8 +456,19 @@ class PolymarketGammaFeed:
 
         # Extract token IDs — Gamma API uses clobTokenIds list aligned with outcomes[]
         # e.g. outcomes=["Up","Down"] → clobTokenIds[0]=YES token, clobTokenIds[1]=NO token
+        # NOTE: Gamma API returns clobTokenIds as a JSON string, not a list — must parse it
         clob_ids = market.get("clobTokenIds") or []
+        if isinstance(clob_ids, str):
+            try:
+                clob_ids = json.loads(clob_ids)
+            except Exception:
+                clob_ids = []
         outcomes  = market.get("outcomes") or []
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except Exception:
+                outcomes = []
         for i, tid in enumerate(clob_ids):
             if not tid:
                 continue
