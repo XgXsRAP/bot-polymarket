@@ -28,8 +28,13 @@ from loguru import logger
 _CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 _SELECTOR = "0x50d25bcd"   # keccak256("latestAnswer()")[:4]
 
+import os
+
 # Polygon RPC fallback chain — tried in order until one succeeds
-_RPC_ENDPOINTS = [
+_rpc_env = os.getenv("POLYGON_RPC_URL", "")
+_RPC_ENDPOINTS = (
+    [_rpc_env] if _rpc_env else []
+) + [
     "https://polygon-rpc.com",       # Official Polygon Foundation RPC
     "https://rpc.ankr.com/polygon",  # Ankr (generous free tier)
     "https://1rpc.io/matic",         # 1RPC fallback
