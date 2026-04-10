@@ -12,11 +12,11 @@
 ║  rebates rather than paying taker fees.                          ║
 ║                                                                  ║
 ║  Modes:                                                          ║
-║    python mm_enhanced1.py --paper      Paper trading (no funds)  ║
-║    python mm_enhanced1.py --live       Live CLOB orders          ║
-║    python mm_enhanced1.py --dual       Live + position lock      ║
-║    python mm_enhanced1.py --signals    Signal monitor only       ║
-║    python mm_enhanced1.py --backtest   Parameter sweep           ║
+║    python mm_enhanced_1.py --paper      Paper trading (no funds)  ║
+║    python mm_enhanced_1.py --live       Live CLOB orders          ║
+║    python mm_enhanced_1.py --dual       Live + position lock      ║
+║    python mm_enhanced_1.py --signals    Signal monitor only       ║
+║    python mm_enhanced_1.py --backtest   Parameter sweep           ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -1153,7 +1153,7 @@ async def run_signal_monitor():
     Live signal monitoring mode — connects to Hyperliquid, Binance, and
     Polymarket Gamma API to print real-time signals feeding EnhancedQuoteEngine.
 
-    Use: python mm_enhanced1.py --signals
+    Use: python mm_enhanced_1.py --signals
     """
     if not HAS_HL_FEED:
         print("ERROR: hyperliquid_api.py not found.")
@@ -1492,6 +1492,15 @@ async def run_paper_trader():
                             f"Warmup: {remaining:.0f}s remaining  "
                             f"5m_ready={has_5m_data}  conf={confidence.score:.0f}"
                         )
+                    age = gamma_feed.price_age if gamma_feed else 0
+                    print(
+                        f"  YES={snapshot.market_best_bid:.4f}  "
+                        f"NO={1-snapshot.market_best_ask:.4f}  "
+                        f"spread={snapshot.market_spread:.4f}  "
+                        f"expiry={snapshot.seconds_to_expiry:.0f}s  "
+                        f"age={age:.1f}s",
+                        flush=True,
+                    )
                     await asyncio.sleep(1)
                     cycle += 1
                     continue
@@ -1624,15 +1633,20 @@ async def run_paper_trader():
             data_loader.record_tick(snapshot)
 
             cycle += 1
-            if cycle % 10 == 0:  # Console heartbeat every 10s
-                s = trader.state
+            s = trader.state
+            print(
+                f"  YES={snapshot.market_best_bid:.4f}  "
+                f"NO={1-snapshot.market_best_ask:.4f}  "
+                f"spread={snapshot.market_spread:.4f}  "
+                f"expiry={snapshot.seconds_to_expiry:.0f}s  "
+                f"pnl={s.realized_pnl:+.2f}  inv={s.net_inventory:+.0f}  "
+                f"conf={confidence.tier}",
+                flush=True,
+            )
+            if cycle % 10 == 0:  # Full summary every 10s
                 logger.info(
-                    f"cycle={cycle} "
-                    f"pnl={s.realized_pnl:+.2f} "
-                    f"inv={s.net_inventory:+.0f} "
-                    f"conf={confidence.score:.0f}%[{confidence.tier}] "
-                    f"fills={s.total_fills} "
-                    f"trips={s.round_trips}"
+                    f"cycle={cycle} fills={s.total_fills} trips={s.round_trips} "
+                    f"conf={confidence.score:.0f}%[{confidence.tier}]"
                 )
 
             await asyncio.sleep(1)
