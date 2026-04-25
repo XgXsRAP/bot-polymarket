@@ -1329,7 +1329,7 @@ async def run_paper_trader():
     if alerter.enabled:
         logger.info("AlertManager: Telegram/Discord alerting active")
 
-    trader = PaperTrader(starting_capital=50.0, max_inventory=25.0, base_quote_size=2.0)
+    trader = PaperTrader(starting_capital=50.0, max_inventory=25.0, base_quote_size=5.0)
     trader.load()
 
     print("""

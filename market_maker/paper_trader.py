@@ -243,13 +243,17 @@ class PaperTrader:
 
         quote_size = self.base_quote_size * confidence_result.size_multiplier
 
-        # Capital-based size cap: risk at most 0.5% of capital per order.
-        # At $50 capital and price ≈ 0.50, max = $0.25 / 0.50 = 0.5 shares.
-        # This prevents oversizing relative to account equity.
+        # Polymarket enforces a $1.00 minimum order value.
+        # Enforce it here so paper results reflect live reality.
+        POLYMARKET_MIN_ORDER_USD = 1.0
+
         if our_bid > 0 or our_ask < 1.0:
             ref_price = our_bid if our_bid > 0 else our_ask
+            # Floor: enough shares to meet the $1 minimum
+            min_size_by_exchange = POLYMARKET_MIN_ORDER_USD / ref_price
+            # Cap: risk at most 2% of remaining cash per order
             max_size_by_capital = (self.state.cash * 0.02) / ref_price
-            quote_size = min(quote_size, max(0.1, max_size_by_capital))
+            quote_size = min(quote_size, max(min_size_by_exchange, max_size_by_capital))
 
         # ── Fill realism: market-crossed check ──
         # A resting bid fills ONLY when someone actively sells at or below
