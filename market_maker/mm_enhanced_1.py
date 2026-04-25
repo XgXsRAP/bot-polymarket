@@ -457,17 +457,39 @@ class EnhancedQuoteEngine:
 
         center = market_mid + fair_lean
 
-        yes_bid = round(max(0.01, center - half_spread - skew), 4)
-        yes_ask = round(min(0.99, center + half_spread - skew), 4)
-        if yes_bid >= yes_ask:
-            yes_bid = round(yes_ask - 0.01, 4)
+        # ── Endgame strategy: match market levels instead of theoretical center ──
+        # In the final 60 seconds, prices converge to extremes (0.99 or 0.01).
+        # Symmetric tight spreads around theoretical center miss the real market flow.
+        # Instead, match the existing bid/ask levels — this ensures we join the active
+        # queue at prices real traders are converging on (not sitting behind in a gap).
+        #
+        # Example: at 30s left, market is 0.93/0.97 (YES heavily favored).
+        # Old: bid=0.925 / ask=0.975 (both behind the queue, never fills)
+        # New: bid=0.93 / ask=0.97 (matches market, joins active orders)
+        if tte < 60 and data.market_best_bid > 0 and data.market_best_ask < 1.0:
+            # Match the market's bid/ask instead of deriving from theoretical center.
+            # Apply small inventory skew to nudge toward neutral if needed.
+            yes_bid = round(max(0.01, data.market_best_bid - skew * 0.3), 4)
+            yes_ask = round(min(0.99, data.market_best_ask + skew * 0.3), 4)
+            if yes_bid >= yes_ask:
+                yes_bid = round(yes_ask - 0.01, 4)
+            # NO side mirrors YES (complementary probabilities)
+            no_bid = round(max(0.01, (1.0 - yes_ask)), 4)
+            no_ask = round(min(0.99, (1.0 - yes_bid)), 4)
+            adjustments["endgame_match"] = "matched_market_levels"
+        else:
+            # Normal regime: symmetric spread around theoretical center
+            yes_bid = round(max(0.01, center - half_spread - skew), 4)
+            yes_ask = round(min(0.99, center + half_spread - skew), 4)
+            if yes_bid >= yes_ask:
+                yes_bid = round(yes_ask - 0.01, 4)
 
-        no_fair = 1.0 - center
-        no_skew = -skew
-        no_bid = round(max(0.01, no_fair - half_spread - no_skew), 4)
-        no_ask = round(min(0.99, no_fair + half_spread - no_skew), 4)
-        if no_bid >= no_ask:
-            no_bid = round(no_ask - 0.01, 4)
+            no_fair = 1.0 - center
+            no_skew = -skew
+            no_bid = round(max(0.01, no_fair - half_spread - no_skew), 4)
+            no_ask = round(min(0.99, no_fair + half_spread - no_skew), 4)
+            if no_bid >= no_ask:
+                no_bid = round(no_ask - 0.01, 4)
 
         return {
             "yes_bid": yes_bid, "yes_ask": yes_ask,
