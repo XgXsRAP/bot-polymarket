@@ -172,29 +172,42 @@ class PolymarketGammaFeed:
 
                 # Get current spread (usually 0.01 but can widen)
                 spread = 0.01
+                raw_spread = None
                 async with session.get(
                     f"{_CLOB_BASE}/spread",
                     params={"token_id": token_id},
                 ) as resp2:
                     if resp2.status == 200:
                         sp_data = await resp2.json()
-                        spread = float(sp_data.get("spread") or 0.01)
+                        raw_spread = float(sp_data.get("spread") or 0.01)
+                        spread = raw_spread
 
                 # Sanity check: a spread > 10¢ means the orderbook is empty
                 # or the market just opened (no liquidity yet). The /spread API
-                # faithfully reports this, but using it would put bid/ask at
-                # extremes (0.01/0.99). Reject — keep last known good prices.
+                # faithfully reports this. Use a default spread instead.
                 if spread > 0.10:
                     logger.debug(
                         f"CLOB spread {spread:.4f} > 10¢ (empty/new market) — "
-                        f"keeping last known prices"
+                        f"using default 0.01 with midpoint {mid:.4f}"
                     )
-                    continue
+                    spread = 0.01
 
                 self._best_bid = round(max(0.01, mid - spread / 2), 4)
                 self._best_ask = round(min(0.99, mid + spread / 2), 4)
                 self._last_update = time.time()
                 self._needs_book_refresh = False
+
+                # Log price updates for debugging
+                if raw_spread and raw_spread > 0.10:
+                    logger.debug(
+                        f"CLOB: mid={mid:.4f} (spread was {raw_spread:.4f}, "
+                        f"clamped to 0.01) → bid={self._best_bid:.4f} ask={self._best_ask:.4f}"
+                    )
+                else:
+                    logger.debug(
+                        f"CLOB: mid={mid:.4f} spread={spread:.4f} → "
+                        f"bid={self._best_bid:.4f} ask={self._best_ask:.4f}"
+                    )
 
             except Exception as e:
                 logger.debug(f"CLOB midpoint poll error: {e}")
