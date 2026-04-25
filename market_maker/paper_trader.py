@@ -248,7 +248,7 @@ class PaperTrader:
         # This prevents oversizing relative to account equity.
         if our_bid > 0 or our_ask < 1.0:
             ref_price = our_bid if our_bid > 0 else our_ask
-            max_size_by_capital = (self.state.cash * 0.005) / ref_price
+            max_size_by_capital = (self.state.cash * 0.02) / ref_price
             quote_size = min(quote_size, max(0.1, max_size_by_capital))
 
         # ── Fill realism: market-crossed check ──
