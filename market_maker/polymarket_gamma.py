@@ -295,7 +295,14 @@ class PolymarketGammaFeed:
                 await asyncio.sleep(5)
 
     def _handle_book_msg(self, raw: str) -> None:
-        """Parse a CLOB WebSocket message and update top-of-book bid/ask."""
+        """Parse a CLOB WebSocket message and update top-of-book bid/ask.
+
+        IMPORTANT: For BTC 5-min markets, the CLOB book typically only contains
+        external user orders parked at extremes (0.01 / 0.99). The Polymarket
+        AMM-derived true price is NOT visible here — only via /midpoint REST.
+        We only trust book data when the resulting spread is reasonable
+        (≤10¢) — otherwise we let the /midpoint poller drive prices instead.
+        """
         try:
             msgs = json.loads(raw)
             if not isinstance(msgs, list):
@@ -306,14 +313,18 @@ class PolymarketGammaFeed:
                     # Full book snapshot: buys sorted desc, sells sorted asc
                     buys = msg.get("buys") or []
                     sells = msg.get("sells") or []
-                    if buys:
-                        self._best_bid = float(buys[0]["price"])
-                    else:
-                        self._best_bid = 0.0
-                    if sells:
-                        self._best_ask = float(sells[0]["price"])
-                    else:
-                        self._best_ask = 1.0
+                    bid = float(buys[0]["price"]) if buys else 0.0
+                    ask = float(sells[0]["price"]) if sells else 1.0
+                    # Reject extreme book (only parked orders at 0.01/0.99 visible)
+                    if (ask - bid) > 0.10:
+                        logger.debug(
+                            f"WS book spread too wide ({bid:.4f}/{ask:.4f}) — "
+                            f"deferring to /midpoint poll"
+                        )
+                        self._needs_book_refresh = True
+                        continue
+                    self._best_bid = bid
+                    self._best_ask = ask
                     self._last_update = time.time()
                     self._needs_book_refresh = False
                 elif etype == "price_change":
@@ -329,13 +340,17 @@ class PolymarketGammaFeed:
                             elif side == "sell" and abs(price - self._best_ask) < 0.0001:
                                 self._needs_book_refresh = True
                             continue
-                        # Update in BOTH directions (not just tighter)
+                        # Only accept price_change updates that don't blow out
+                        # the spread beyond 10¢ — protects against extreme
+                        # parked-order updates overwriting AMM-derived prices.
                         if side == "buy" and price >= self._best_bid:
-                            self._best_bid = price
-                            self._last_update = time.time()
+                            if (self._best_ask - price) <= 0.10:
+                                self._best_bid = price
+                                self._last_update = time.time()
                         elif side == "sell" and (self._best_ask >= 1.0 or price <= self._best_ask):
-                            self._best_ask = price
-                            self._last_update = time.time()
+                            if (price - self._best_bid) <= 0.10:
+                                self._best_ask = price
+                                self._last_update = time.time()
         except Exception as exc:
             logger.warning(f"PolymarketGamma WS parse error: {exc}")
 
