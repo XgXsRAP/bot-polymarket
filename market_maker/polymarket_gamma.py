@@ -180,6 +180,17 @@ class PolymarketGammaFeed:
                         sp_data = await resp2.json()
                         spread = float(sp_data.get("spread") or 0.01)
 
+                # Sanity check: a spread > 10¢ means the orderbook is empty
+                # or the market just opened (no liquidity yet). The /spread API
+                # faithfully reports this, but using it would put bid/ask at
+                # extremes (0.01/0.99). Reject — keep last known good prices.
+                if spread > 0.10:
+                    logger.debug(
+                        f"CLOB spread {spread:.4f} > 10¢ (empty/new market) — "
+                        f"keeping last known prices"
+                    )
+                    continue
+
                 self._best_bid = round(max(0.01, mid - spread / 2), 4)
                 self._best_ask = round(min(0.99, mid + spread / 2), 4)
                 self._last_update = time.time()
@@ -540,10 +551,13 @@ class PolymarketGammaFeed:
     @property
     def is_tradeable(self) -> bool:
         """Prices are fresh enough and confirmed for the current market."""
+        # Reject extreme spreads (empty orderbook or corrupted data)
+        spread_ok = (self._best_ask - self._best_bid) <= 0.10
         return (
             self.price_age < 10.0
             and self._best_bid > 0.0
             and self._best_ask < 1.0
+            and spread_ok
             and not self._using_cached_market
         )
 
