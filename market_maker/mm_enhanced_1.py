@@ -243,8 +243,34 @@ class EnhancedFairValueEngine:
         signal_strength = (abs(data.funding_signal) + abs(data.btc_change_5m / 0.01)) / 2
         signal_strength = min(1.0, signal_strength)  # clamp to [0, 1]
         market_weight = 0.60 - 0.20 * signal_strength  # ranges 0.40–0.60
+
+        # ── Expiry-aware market weight ──
+        # As expiry approaches, the market price becomes much more reliable than
+        # momentum-based predictions because:
+        #   1. sqrt(seconds_left) shrinks → outcome becomes nearly deterministic
+        #      (Black-Scholes: z = price_delta / (strike * vol * sqrt(t)))
+        #   2. Order flow at extreme prices ($0.85+, $0.15-) reflects high conviction
+        #   3. Momentum signals lose predictive power when there's no time for
+        #      another reversal to occur
+        # Below 60s remaining, ramp market_weight from its base value up to 0.99.
+        # At 5s or less, use market price entirely (market = ground truth).
+        seconds_left = data.seconds_to_expiry if data.seconds_to_expiry > 0 else 300.0
+        if seconds_left <= 5:
+            market_weight = 0.99
+        elif seconds_left < 60:
+            # Linear ramp from base weight at 60s → 0.99 at 5s
+            ramp = (60 - seconds_left) / 55.0  # 0.0 at 60s, 1.0 at 5s
+            expiry_market_weight = market_weight + (0.99 - market_weight) * ramp
+            market_weight = max(market_weight, expiry_market_weight)
+
         fair_value = model_estimate * (1 - market_weight) + market_yes_price * market_weight
 
+        # Clamp bounds: extremes are valid near expiry (markets legitimately
+        # trade at $0.97+ or $0.03- when outcome is nearly determined).
+        # Above 60s, keep the conservative [0.05, 0.95] band; near expiry,
+        # allow [0.01, 0.99] so the FV can track real market behavior.
+        if seconds_left < 60:
+            return min(max(fair_value, 0.01), 0.99)
         return min(max(fair_value, 0.05), 0.95)
 
 
