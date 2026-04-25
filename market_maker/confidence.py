@@ -29,6 +29,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from loguru import logger
 from fees import minimum_profitable_spread
 
 
