@@ -91,6 +91,49 @@ class ConfidenceCalculator:
         consecutive_losses: int = 0,
     ) -> ConfidenceResult:
 
+        # ── Market sanity check ──
+        # Reject if market prices are corrupted or nonsensical.
+        # This catches cases where the Gamma feed returns bid=0/ask=1 (window rolled)
+        # or the market bid/ask pair violates arbitrage-free bounds.
+        market_bid = snapshot.market_best_bid
+        market_ask = snapshot.market_best_ask
+
+        market_sanity = True
+        sanity_reason = ""
+
+        # Check 1: bid and ask within valid bounds
+        if market_bid < 0.005 or market_ask > 0.995:
+            market_sanity = False
+            sanity_reason = "market at boundary (bid<0.5c or ask>99.5c)"
+
+        # Check 2: bid < ask (fundamental arbitrage condition)
+        if market_bid > market_ask:
+            market_sanity = False
+            sanity_reason = "bid > ask (inverted)"
+
+        # Check 3: spread not wider than 50¢ (50% spread = data corruption)
+        if market_ask - market_bid > 0.50:
+            market_sanity = False
+            sanity_reason = "spread > 50¢ (corrupted market data)"
+
+        # If market data is bad, return PAUSED with low confidence
+        if not market_sanity:
+            logger.warning(f"Market sanity check failed: {sanity_reason}")
+            return ConfidenceResult(
+                score=0.0,
+                tier="PAUSED",
+                size_multiplier=0.0,
+                spread_multiplier=2.0,
+                reason=f"Market sanity failed: {sanity_reason}",
+                signal_agreement=0.0,
+                data_freshness=0.0,
+                spread_health=0.0,
+                inventory_neutral=0.0,
+                volatility_penalty=0.0,
+                loss_streak_penalty=0.0,
+                model_accuracy_penalty=0.0,
+            )
+
         # Record volatility sample for rolling window
         if snapshot.btc_volatility_1m:
             self._vol_history.append(snapshot.btc_volatility_1m)
